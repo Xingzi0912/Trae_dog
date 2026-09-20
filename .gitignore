@@ -19,6 +19,8 @@ logs/
 
 # MuJoCo 可视化缓存
 *.mjb
+MJMODEL.TXT
+MJDATA.TXT
 
 # IDE
 .vscode/
