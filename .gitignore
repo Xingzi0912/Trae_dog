@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境（复用 d:/data/Trae/deep-learning/.venv，本目录内不应有 venv）
+.venv/
+venv/
+env/
+
+# 训练产物
+checkpoints/
+logs/
+*.pt
+*.onnx
+*.png
+
+# MuJoCo 可视化缓存
+*.mjb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
