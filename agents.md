@@ -50,7 +50,11 @@ PPO 输出 **12 维目标关节角 q_des ∈ [-1,1]**，**不直接发力矩**�
 ### 决策 3：模型文件路径
 
 - TOE_dog2 保持原位 `d:/data/Trae/robot-dog/TOE_dog2/`，被 `robot-dog/AGENTS.md` 引用
-- 通过绝对路径加载 `scene.xml`，不复制模型文件，避免多版本同步问题
+- ~~通过绝对路径加载 `scene.xml`，不复制模型文件，避免多版本同步问题~~
+- **2026-09-22 变更（服务器部署）**：dog_rl 仓库自包含——STL 复制到
+  `envs/assets/`（18.3MB），dog_positional.xml 的 meshdir 改相对路径 `"assets"`
+  （相对该 XML 所在 envs/ 目录，include 场景已实测）。克隆即跑，无需在
+  服务器上重建 d:/data/... 目录结构。TOE_dog2 原位资产仍保留不动。
 
 ### 决策 4：Python 环境
 
@@ -102,12 +106,18 @@ d:\data\Trae\dog_rl\
 
 ## 关键参数清单
 
-### 观测空间设计（48 维，业界标准）
+### 观测空间设计（58 维，2026-09-22 决策确认）
 
-- 本体状态 10 维：base 高度 z、姿态（四元数→欧拉 或 直接 4 元）、线速度 3、角速度 3
-- 关节状态 24 维：12 位置 + 12 速度
+> 原写"48 维业界标准"，但下列分量加总实为 58；经确认按 **58 维全量版**实现
+> （关节位置用绝对角 + 保留常量偏置）。所有速度投影到 **base 机身系**。
+
+- 本体状态 10 维：base 高度 z、roll/pitch/yaw 3、机身系线速度 3、机身系角速度 3
+- 关节状态 24 维：12 位置（绝对角）+ 12 速度
 - 上一步动作 12 维（助稳定）
-- 默认关节偏置 12 维（PPO 攻势项，鼓励回归站立位）
+- 默认关节偏置 12 维（常量，PPO 攻势项，鼓励回归站立位）
+
+obs 索引：[0]=z，[1:4]=rpy，[4:7]=lin_vel，[7:10]=ang_vel，
+[10:22]=q，[22:34]=dq，[34:46]=last_action，[46:58]=q_default。
 
 ### 动作空间
 
@@ -139,7 +149,7 @@ r = +1.0  × forward_x_speed            # 前进速度（主目标）
 | 项           | 14 号值        | 改成     | 理由               |
 | ------------ | -------------- | -------- | ------------------ |
 | ENV_ID       | HalfCheetah-v5 | DogEnv() | 自定义环境         |
-| state_dim    | 17             | 48       | 观测维度升级       |
+| state_dim    | 17             | 58       | 观测维度升级       |
 | action_dim   | 6              | 12       | 12 关节            |
 | 网络规模     | 256×256        | 512×512  | 观测复杂           |
 | TOTAL_STEPS  | 1M             | 20M~50M  | 步态学习慢         |
@@ -165,10 +175,12 @@ r = +1.0  × forward_x_speed            # 前进速度（主目标）
 
 ### Step 3：接入 PPO 训练
 
-- [ ] 从 `14_ppo_mujoco.py` 拆出 `algos/networks.py` + `algos/ppo.py`
-- [ ] 改 state_dim=48, action_dim=12
-- [ ] 网络规模 256→512
-- [ ] 先 1M 步看曲线对不对（reward 上行、loss 收敛）
+- [x] 从 `14_ppo_mujoco.py` 拆出 `algos/networks.py` + `algos/ppo.py`
+- [x] 改 state_dim=58, action_dim=12（58 维全量决策，见关键参数清单）
+- [x] 网络规模 256→512
+- [x] frame_skip=10（500Hz 物理 → 50Hz 策略）+ 速度改 base 机身系投影
+- [x] 20,480 步冒烟测试通过（管线全通，评估 487.8 ≈ 零策略基线）
+- [ ] 先 1M 步看曲线对不对（reward 上行、loss 收敛；140 step/s ≈ 2h）
 
 ### Step 4：obs 归一化 + 域随机化
 
@@ -303,3 +315,33 @@ r = +1.0  × forward_x_speed            # 前进速度（主目标）
 `algos/networks.py`（PolicyNetwork 48→512→512→12 + ValueNetwork）和
 `algos/ppo.py`（collect_rollout / compute_gae / update_ppo），
 同时把 DogEnv obs 从 19 维 qpos 占位升级到 48 维规范观测。
+
+### 2026-09-22 — Step 3 PPO 接入与冒烟
+
+- 先提交 Step 2 checkpoint（commit `b410a14`）
+- **obs 决策修正**：原"48 维"清单加总实为 58，确认按 **58 维全量版**
+  （本体10 + 关节24 + 上步动作12 + 常量偏置12），速度一律投影到 base 机身系
+- `envs/dog_env.py` 改造：
+  - frame_skip=10（物理 500Hz → 策略 50Hz，单局 1000 step = 20s），
+    子步循环中途塌倒即停
+  - `_get_kinematics()`：xmat 旋转矩阵 R，机身系 v/ω = Rᵀ × 世界系 qvel
+  - reward forward 改用机身系 vx；obs 升级 58 维
+- 新建 `algos/networks.py`：PolicyNetwork/ValueNetwork（hidden 512，
+  Actor 299k / Critic 293k 参数）
+- 新建 `algos/ppo.py`：PPOConfig 数据类 + collect_rollout/compute_gae/
+  update_ppo/evaluate（entropy_beta=0.01）
+- 新建 `train.py`：支持 `python train.py [总步数]`，best/final checkpoint
+  落 checkpoints/，学习曲线落 logs/dog_ppo_curve.png
+- **20,480 步冒烟通过**：评估 487.8±0.0（≈零策略基线 500）、H=10.91
+  （σ≈0.6 理论值）、vloss=1.0 无异常；⚠ clip_frac=42% / kl=0.039 偏高，
+  1M 步重点观察是否回落到健康区
+- 速度 140 step/s → 1M 步约 2 小时
+
+**下一步**：前台跑 `python train.py`（1M 步），看 reward 是否上行、
+clip/kl 是否回落、σ 是否健康分化。
+
+- **部署修复（同日）**：发现 meshdir Windows 绝对路径在 Linux 服务器必挂，
+  已复制 assets 进仓库（envs/assets，18.3MB）+ meshdir 改相对路径，
+  本地 20,480 步重测通过（结果与绝对路径版完全一致 487.8）。
+- 部署目标：服务器 i9-14900K + RTX 4090（CUDA 12.8 驱动），克隆到
+  ~/Sxy_bigdog/Trae_dog，独立 venv + cu128 torch。

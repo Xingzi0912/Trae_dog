@@ -1,7 +1,8 @@
 <mujoco model="dog_positional">
   <!-- 基于 TOE_dog2/xml/dog.xml，按 agents.md 决策1 改造为位置控制方案 -->
-  <!-- 改动1：meshdir 改为绝对路径，指向原 TOE_dog2 资产目录（不复制 STL） -->
-  <compiler angle="radian" meshdir="d:/data/Trae/robot-dog/TOE_dog2/xml/assets" autolimits="true" />
+  <!-- meshdir 相对路径：相对于本文件（dog_positional.xml）所在的 envs/ 目录 → envs/assets -->
+  <!-- 2026-09-22：原 Windows 绝对路径改为仓库自包含（assets 已复制进 envs/assets），支持服务器克隆即跑 -->
+  <compiler angle="radian" meshdir="assets" autolimits="true" />
 
   <option cone="elliptic" impratio="100" />
   <default>

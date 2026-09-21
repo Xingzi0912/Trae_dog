@@ -1,16 +1,36 @@
-"""DogEnv —— 机器狗 Gymnasium 环境最小骨架（Step 1）
+"""DogEnv —— 机器狗 Gymnasium 环境（Step 3：接入 PPO 版）
 
-只验证一件事：零策略下机器狗能否在 MuJoCo 中维持站立姿态不塌。
+控制链路：
+    PPO 输出 12 维 action ∈ [-1,1]
+      → q_des = q_default + action × 0.25
+      → XML <position> actuator（kp=60, kv=2）PD 输出力矩
+    action = 0 时 q_des = q_default = [0, 0.9, -1.8] × 4，维持站立姿态。
 
-零策略语义（agents.md 决策1）：
-    action = 0  →  q_des = q_default + 0 × 0.25 = q_default
-    q_default = [0, 0.9, -1.8] × 4  （hip=0, thigh=0.9, calf=-1.8，四条腿一致）
-PD 控制器（kp=60, kv=2，由 XML 的 <position> actuator 实现）应能 hold 住这个姿态。
+时间尺度（Step 3 新增）：
+    物理步长 = MuJoCo 默认 0.002s（500Hz）
+    frame_skip = 10 → 策略频率 50Hz（dt=0.02s，对齐 agents.md 实机控制周期）
+    1000 个 policy step = 20s（legged_gym 标准单局时长）
 
-本文件暂不实现：
-    - 48 维观测（Step 2）—— 当前 obs 直接返回 qpos 占位
-    - reward（Step 2）—— 当前恒为 0
-    - 域随机化（Step 4）
+观测空间（Step 3 决策：58 维全量版，base 机身系）：
+    [ 0]    base_z 高度（世界系）                    1
+    [ 1: 4] roll / pitch / yaw                       3
+    [ 4: 7] base 线速度（机身系）                    3
+    [ 7:10] base 角速度（机身系）                    3
+    [10:22] 12 关节位置（绝对角）                   12
+    [22:34] 12 关节速度                             12
+    [34:46] 上一步动作（助稳定）                    12
+    [46:58] q_default 常量偏置（攻势项）            12
+    合计 58。
+    说明：agents.md 原写"48 维"但其分量清单加总为 58，2026-09-22 确认按
+          58 维全量实现（关节位置用绝对值 + 保留常量偏置）。
+
+reward 4 分量（agents.md）：
+    r = +1.0  × forward_x_speed（机身系 vx，Step 3 从世界系改投影）
+      - 0.05  × Σ action²
+      - 0.001 × Σ (action - last_action)²
+      + 0.5  × upright_bonus（|roll|,|pitch| < 0.4）
+
+暂不实现：obs 归一化 + 域随机化（Step 4）。
 
 调用：
     env = DogEnv()
@@ -26,7 +46,7 @@ from pathlib import Path
 
 
 class DogEnv(gym.Env):
-    """机器狗环境最小骨架 - Step 1 验证零策略站立不塌"""
+    """机器狗环境 - 50Hz 策略 / 58 维观测 / 位置控制"""
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
 
@@ -37,6 +57,8 @@ class DogEnv(gym.Env):
         dtype=np.float64,
     )
     ACTION_SCALE = 0.25  # q_des = q_default + action × 0.25
+    FRAME_SKIP = 10      # 0.002s × 10 = 0.02s（50Hz 策略）
+    OBS_DIM = 58
 
     def __init__(self, scene_path: str = None, render_mode: str = None):
         if scene_path is None:
@@ -48,15 +70,14 @@ class DogEnv(gym.Env):
         # 12 维动作 [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
 
-        # Step 1 占位 obs：直接返回 qpos（19 维 = 7 free + 12 joint）
-        # Step 2 会改成 48 维（本体状态 + 关节 + 上一步动作 + 默认偏置）
-        self._nq = self.model.nq
+        # 58 维规范观测（见模块 docstring 布局）
+        # Step 4 会在外部加 RunningMeanStd 归一化，本空间保持原始物理尺度
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self._nq,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.OBS_DIM,), dtype=np.float32
         )
 
         # 模型结构自检（加载后立刻报错好排查 XML 问题）
-        assert self._nq == 19, f"Expected nq=19 (7 freejoint + 12 joints), got {self._nq}"
+        assert self.model.nq == 19, f"Expected nq=19 (7 freejoint + 12 joints), got {self.model.nq}"
         assert self.model.nv == 18, f"Expected nv=18 (6 free + 12 joints), got {self.model.nv}"
         assert self.model.nu == 12, f"Expected nu=12 actuators, got {self.model.nu}"
 
@@ -66,7 +87,7 @@ class DogEnv(gym.Env):
         )
         assert self._home_key_id >= 0, "keyframe 'home' not found in XML"
 
-        # base_link body id 用于读 base z
+        # base_link body id 用于读 base z / xmat 姿态旋转矩阵
         self._base_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, "base_link"
         )
@@ -98,44 +119,69 @@ class DogEnv(gym.Env):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         q_des = self.Q_DEFAULT + action * self.ACTION_SCALE
         self.data.ctrl[:] = q_des
-        mujoco.mj_step(self.model, self.data)
+
+        # 10 个物理子步 = 1 个策略步（500Hz → 50Hz）
+        # 中途塌倒立即停止子步进，停在塌倒时刻的状态
+        for _ in range(self.FRAME_SKIP):
+            mujoco.mj_step(self.model, self.data)
+            if float(self.data.xpos[self._base_body_id, 2]) < self._z_terminate:
+                break
 
         self._step_count += 1
-        obs = self._get_obs()
-        base_z = float(self.data.xpos[self._base_body_id, 2])
-        terminated = base_z < self._z_terminate
+        kin = self._get_kinematics()
+        terminated = kin["base_z"] < self._z_terminate
         truncated = self._step_count >= self._max_steps
-        reward, reward_info = self._compute_reward(action)
-        info = {"base_z": base_z, "step": self._step_count, **reward_info}
+        reward, reward_info = self._compute_reward(action, kin)
+        obs = self._get_obs()
+        info = {"base_z": kin["base_z"], "step": self._step_count, **reward_info}
         # 更新上一步动作（必须放在 _compute_reward 之后，否则抖动惩罚会用错基准）
         self._last_action = action.copy()
         return obs, reward, terminated, truncated, info
 
-    def _compute_reward(self, action: np.ndarray) -> tuple[float, dict]:
-        """reward 4 分量（agents.md 第 113-118 行）
+    # ------------------------------------------------------------
+    # 运动学：世界系状态 + 投影到 base 机身系（50Hz 每 policy step 算一次）
+    # ------------------------------------------------------------
+    def _get_kinematics(self) -> dict:
+        base_z = float(self.data.xpos[self._base_body_id, 2])
+        quat = self.data.qpos[3:7]
+        roll, pitch, yaw = self._quat_to_rpy(quat)
 
-        r = +1.0  × forward_x_speed              # 前进速度（主目标）
+        # freejoint qvel: [0:3]=世界系线速度, [3:6]=世界系角速度
+        # xmat = base body 相对世界系的旋转矩阵 R（行主序 9 个数）
+        # 机身系向量 v_b = R^T @ v_w
+        R = self.data.xmat[self._base_body_id].reshape(3, 3)
+        lin_vel_base = R.T @ self.data.qvel[0:3]
+        ang_vel_base = R.T @ self.data.qvel[3:6]
+
+        return {
+            "base_z": base_z,
+            "roll": roll,
+            "pitch": pitch,
+            "yaw": yaw,
+            "lin_vel_base": lin_vel_base,
+            "ang_vel_base": ang_vel_base,
+        }
+
+    def _compute_reward(self, action: np.ndarray, kin: dict) -> tuple[float, dict]:
+        """reward 4 分量（agents.md）
+
+        r = +1.0  × forward_x_speed              # 前进速度（机身系 vx，主目标）
           - 0.05 × Σ action²                      # 能耗惩罚
           - 0.001 × Σ (action - last_action)²     # 抖动惩罚
           + 0.5  × upright_bonus                  # 别摔倒（roll,pitch<0.4）
-
-        Step 2 阶段：obs 维度暂未扩展，reward 内部直接从 data 读状态，
-        不依赖 obs 数组。Step 3 接 PPO 时再统一 obs 48 维规范化。
         """
-        # 前进速度：base 线速度 x 分量（世界系，keyframe home 时 qvel[0]=0）
-        # Step 2 验证阶段狗不转向，世界系 = base 系；Step 3 再投影到 base 系
-        forward_x_speed = float(self.data.qvel[0])
+        # 前进速度：机身系 vx。狗转向后"前进"语义仍正确（Step 3 改）
+        forward_x_speed = float(kin["lin_vel_base"][0])
 
         # 能耗（action 已 clip 到 [-1,1]）
         action_sq_sum = float(np.sum(action ** 2))
 
-        # 抖动（与上一步动作差）
+        # 抖动（与上一步动作差）；policy step=0.02s 后该惩罚尺度比 Step 2 合理
         action_diff = action - self._last_action
         action_diff_sq_sum = float(np.sum(action_diff ** 2))
 
-        # 姿态：四元数 → roll, pitch（MuJoCo quat 顺序 [w, x, y, z]）
-        quat = self.data.qpos[3:7]
-        roll, pitch, _ = self._quat_to_rpy(quat)
+        # 姿态：upright 二值奖励
+        roll, pitch = kin["roll"], kin["pitch"]
         upright = 1.0 if (abs(roll) < 0.4 and abs(pitch) < 0.4) else 0.0
 
         r_forward = 1.0 * forward_x_speed
@@ -173,14 +219,25 @@ class DogEnv(gym.Env):
         return np.array([roll, pitch, yaw])
 
     def _get_obs(self):
-        # Step 1 占位：直接返回 qpos。Step 2 改成 48 维完整观测。
-        return self.data.qpos.copy().astype(np.float32)
+        """构造 58 维观测（布局见模块 docstring）"""
+        kin = self._get_kinematics()
+        obs = np.concatenate([
+            [kin["base_z"]],                 #  0   base z（世界系）
+            [kin["roll"], kin["pitch"], kin["yaw"]],       #  1:4
+            kin["lin_vel_base"],             #  4:7  机身系线速度
+            kin["ang_vel_base"],             #  7:10 机身系角速度
+            self.data.qpos[7:],              # 10:22 关节位置（绝对角）
+            self.data.qvel[6:],              # 22:34 关节速度
+            self._last_action,               # 34:46 上一步动作
+            self.Q_DEFAULT,                  # 46:58 默认偏置常量
+        ])
+        return obs.astype(np.float32)
 
     def render(self):
         if self.render_mode != "rgb_array":
             raise gym.error.UnsupportedMode(
-                f"render_mode={self.render_mode!r}（Step 1 仅支持 rgb_array；"
-                "交互式可视化用 mujoco.viewer，见 Step 1.5）"
+                f"render_mode={self.render_mode!r}（当前仅支持 rgb_array；"
+                "交互式可视化用 mujoco.viewer，见 scripts/view_stand.py）"
             )
         if self._renderer is None:
             self._renderer = mujoco.Renderer(self.model)
@@ -194,22 +251,26 @@ class DogEnv(gym.Env):
 
 
 # ============================================================
-# 自检：跑零策略 1000 步，打印 base z 曲线（Step 1.3 验证）
+# 自检：零策略跑满 1000 个 policy step（20s 仿真），打印 base z
 # 直接 `python dog_env.py` 运行
-# 期望：1000 步后 base_z 仍 > 0.25m，狗不塌
+# 期望：base_z 始终 > 0.25m，狗不塌；观测为 58 维
 # ============================================================
 if __name__ == "__main__":
     env = DogEnv()
     obs, info = env.reset()
     print(f"[reset] base_z = {info['base_z']:.4f} m （站立目标 ≈ 0.27m）")
-    print(f"[reset] obs (qpos 19 维) = {obs}")
-    print(f"        前 7 维 (freejoint xyz+quat): {obs[:7]}")
-    print(f"        后 12 维 (关节角): {obs[7:]}")
+    print(f"[reset] obs {obs.shape[0]} 维")
+    print(f"        [0] base_z      = {obs[0]:.4f}")
+    print(f"        [1:4] rpy       = {obs[1:4]}")
+    print(f"        [4:7] lin vel b = {obs[4:7]}")
+    print(f"        [7:10] ang vel b= {obs[7:10]}")
+    print(f"        [10:22] joint q = {obs[10:22]}")
+    print(f"        [46:58] q_def   = {obs[46:58]}")
     print()
 
     z_history = [info["base_z"]]
     action = np.zeros(12, dtype=np.float32)  # 零策略
-    print("开始跑零策略 1000 步 ...")
+    print("开始跑零策略 1000 policy step（frame_skip=10，20s 仿真）...")
     for step in range(1000):
         obs, r, terminated, truncated, info = env.step(action)
         z_history.append(info["base_z"])
