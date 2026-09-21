@@ -1,4 +1,4 @@
-"""DogEnv —— 机器狗 Gymnasium 环境（Step 3：接入 PPO 版）
+"""DogEnv —— 机器狗 Gymnasium 环境（Step 4：域随机化版）
 
 控制链路：
     PPO 输出 12 维 action ∈ [-1,1]
@@ -6,12 +6,12 @@
       → XML <position> actuator（kp=60, kv=2）PD 输出力矩
     action = 0 时 q_des = q_default = [0, 0.9, -1.8] × 4，维持站立姿态。
 
-时间尺度（Step 3 新增）：
+时间尺度：
     物理步长 = MuJoCo 默认 0.002s（500Hz）
     frame_skip = 10 → 策略频率 50Hz（dt=0.02s，对齐 agents.md 实机控制周期）
     1000 个 policy step = 20s（legged_gym 标准单局时长）
 
-观测空间（Step 3 决策：58 维全量版，base 机身系）：
+观测空间（58 维全量版，base 机身系）：
     [ 0]    base_z 高度（世界系）                    1
     [ 1: 4] roll / pitch / yaw                       3
     [ 4: 7] base 线速度（机身系）                    3
@@ -21,22 +21,31 @@
     [34:46] 上一步动作（助稳定）                    12
     [46:58] q_default 常量偏置（攻势项）            12
     合计 58。
-    说明：agents.md 原写"48 维"但其分量清单加总为 58，2026-09-22 确认按
-          58 维全量实现（关节位置用绝对值 + 保留常量偏置）。
 
 reward 4 分量（agents.md）：
-    r = +1.0  × forward_x_speed（机身系 vx，Step 3 从世界系改投影）
+    r = +1.0  × forward_x_speed（机身系 vx）
       - 0.05  × Σ action²
       - 0.001 × Σ (action - last_action)²
       + 0.5  × upright_bonus（|roll|,|pitch| < 0.4）
 
-暂不实现：obs 归一化 + 域随机化（Step 4）。
+Step 4 域随机化（每次 reset 重新采样，见 RandConfig）：
+    ① 地面摩擦 floor.geom_friction[0] ∈ [0.5, 1.8]
+       （MuJoCo 接触摩擦 = 两 geom 相乘，足底 0.9 → 接触对 0.45~1.62）
+    ② 机身质量 ×[0.8, 1.2]
+    ③ PD 增益 kp/kv 各 ×[0.8, 1.2]
+    ④ 初始状态：base z/姿态、关节角 ±0.05rad、关节速度 ±0.5rad/s 扰动
+    ⑤ 动作延迟 0~2 个策略步（0~40ms，对齐实机通信延迟）
+    ⑥ 观测高斯噪声（速度类为主，模拟 IMU/编码器误差）
 
 调用：
-    env = DogEnv()
-    obs, info = env.reset()
+    env = DogEnv()                       # 默认开启域随机化
+    env = DogEnv(rand_config=RandConfig(enabled=False))  # 标称环境
+    obs, info = env.reset(seed=0)
     obs, r, term, trunc, info = env.step(np.zeros(12))
 """
+
+from dataclasses import dataclass
+from collections import deque
 
 import gymnasium as gym
 import mujoco
@@ -45,8 +54,51 @@ from gymnasium import spaces
 from pathlib import Path
 
 
+@dataclass
+class RandConfig:
+    """域随机化参数（范围为【每局独立采样】的均匀分布）
+
+    范围设计参考 legged_gym go2 默认 DR，按本狗 6.5kg/位置控制做了收敛：
+        - 摩擦/质量/PD：±20% 起步，避免一开 DR 就训不动
+        - 初态扰动：让评估 10 局不再是同一条轨迹（eval std 有意义）
+        - 延迟/噪声：实机 sim2real 的主要 gap 源
+    """
+    enabled: bool = True
+    # ① 地面摩擦（绝对值，floor geom friction[0]）
+    friction_range: tuple = (0.5, 1.8)
+    # ② 机身质量（乘性）
+    base_mass_range: tuple = (0.8, 1.2)
+    # ③ PD 增益（乘性，整局各关节共用一个尺度）
+    kp_scale_range: tuple = (0.8, 1.2)
+    kv_scale_range: tuple = (0.8, 1.2)
+    # ④ 初始状态
+    init_base_z_range: tuple = (0.27, 0.32)   # keyframe 标称 0.27
+    init_rpy_noise: float = 0.1               # rad，三轴同幅
+    init_joint_noise: float = 0.05            # rad
+    init_base_vel_noise: float = 0.1          # m/s（线速度）/ rad/s（角速度）
+    init_jointvel_noise: float = 0.5          # rad/s
+    # ⑤ 动作延迟（策略步，整数闭区间）
+    action_delay_range: tuple = (0, 2)
+    # ⑥ 观测噪声总开关/尺度（1.0=默认强度，0=关闭）
+    obs_noise_scale: float = 1.0
+
+
+# 各观测分量的加性高斯噪声标准差（对应 58 维布局，× obs_noise_scale）
+# 参考实机传感器精度：IMU 速度 ≈0.1m/s、陀螺仪 ≈0.05rad/s、关节编码器位置 ≈0.01rad
+_OBS_NOISE_STD = np.concatenate([
+    [0.01],                              #  0    base_z
+    np.full(3, 0.01),                    #  1:4  rpy
+    np.full(3, 0.10),                    #  4:7  机身系线速度
+    np.full(3, 0.05),                    #  7:10 机身系角速度
+    np.full(12, 0.01),                   # 10:22 关节位置
+    np.full(12, 0.15),                   # 22:34 关节速度
+    np.zeros(12),                        # 34:46 last_action（自身已知量）
+    np.zeros(12),                        # 46:58 q_default（常量）
+]).astype(np.float64)
+
+
 class DogEnv(gym.Env):
-    """机器狗环境 - 50Hz 策略 / 58 维观测 / 位置控制"""
+    """机器狗环境 - 50Hz 策略 / 58 维观测 / 位置控制 / 域随机化"""
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
 
@@ -60,9 +112,14 @@ class DogEnv(gym.Env):
     FRAME_SKIP = 10      # 0.002s × 10 = 0.02s（50Hz 策略）
     OBS_DIM = 58
 
-    def __init__(self, scene_path: str = None, render_mode: str = None):
+    def __init__(self, scene_path: str = None, render_mode: str = None,
+                 rand_config: RandConfig = None):
         if scene_path is None:
             scene_path = str(Path(__file__).parent / "scene_positional.xml")
+        if rand_config is None:
+            rand_config = RandConfig()
+        self.rand_cfg = rand_config
+
         self.model = mujoco.MjModel.from_xml_path(scene_path)
         self.data = mujoco.MjData(self.model)
         self.render_mode = render_mode
@@ -71,7 +128,7 @@ class DogEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
 
         # 58 维规范观测（见模块 docstring 布局）
-        # Step 4 会在外部加 RunningMeanStd 归一化，本空间保持原始物理尺度
+        # 外部 RunningMeanStd 做归一化，本空间保持原始物理尺度
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.OBS_DIM,), dtype=np.float32
         )
@@ -93,6 +150,18 @@ class DogEnv(gym.Env):
         )
         assert self._base_body_id >= 0, "body 'base_link' not found in XML"
 
+        # floor geom id（摩擦随机化目标，scene_positional.xml 中命名 floor）
+        self._floor_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+        )
+        assert self._floor_geom_id >= 0, "geom 'floor' not found in scene XML"
+
+        # 随机化要改的标称模型参数（每次 reset 先恢复再采样，保证各局独立）
+        self._nom_body_mass = self.model.body_mass.copy()
+        self._nom_geom_friction = self.model.geom_friction.copy()
+        self._nom_gainprm = self.model.actuator_gainprm.copy()
+        self._nom_biasprm = self.model.actuator_biasprm.copy()
+
         # 终止阈值与步数上限（agents.md 关键参数清单）
         self._z_terminate = 0.25  # base z < 0.25m 视为塌倒
         self._max_steps = 1000
@@ -101,15 +170,34 @@ class DogEnv(gym.Env):
         # 上一步动作（reward 抖动惩罚需要；reset 时重置）
         self._last_action = np.zeros(12, dtype=np.float64)
 
+        # 动作延迟队列（reset 时按采样延迟重建）
+        self._ctrl_queue = deque()
+
         self._renderer = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         # 用 keyframe home 重置：自动设好 qpos + ctrl 到站立姿态
         mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key_id)
+
+        # 恢复标称模型参数，再按新一局采样（DR 关闭时即为标称环境）
+        self.model.body_mass[:] = self._nom_body_mass
+        self.model.geom_friction[:] = self._nom_geom_friction
+        self.model.actuator_gainprm[:] = self._nom_gainprm
+        self.model.actuator_biasprm[:] = self._nom_biasprm
+        if self.rand_cfg.enabled:
+            self._apply_randomization()
+
         mujoco.mj_forward(self.model, self.data)
         self._step_count = 0
         self._last_action = np.zeros(12, dtype=np.float64)  # 抖动惩罚基准
+
+        # 重建动作延迟队列：延迟 d 步 → 预置 d 个 q_default，前 d 步执行默认姿态
+        d = self._sample_delay()
+        self._ctrl_queue = deque(
+            [self.Q_DEFAULT.copy() for _ in range(d)], maxlen=d + 1
+        )
+
         obs = self._get_obs()
         info = {"base_z": float(self.data.xpos[self._base_body_id, 2])}
         return obs, info
@@ -118,7 +206,10 @@ class DogEnv(gym.Env):
         # action ∈ [-1, 1]^12 → q_des = q_default + action × 0.25
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         q_des = self.Q_DEFAULT + action * self.ACTION_SCALE
-        self.data.ctrl[:] = q_des
+
+        # 动作延迟：新指令入队，执行队首（最旧）指令；delay=0 时即时执行
+        self._ctrl_queue.append(q_des)
+        self.data.ctrl[:] = self._ctrl_queue[0]
 
         # 10 个物理子步 = 1 个策略步（500Hz → 50Hz）
         # 中途塌倒立即停止子步进，停在塌倒时刻的状态
@@ -137,6 +228,60 @@ class DogEnv(gym.Env):
         # 更新上一步动作（必须放在 _compute_reward 之后，否则抖动惩罚会用错基准）
         self._last_action = action.copy()
         return obs, reward, terminated, truncated, info
+
+    # ------------------------------------------------------------
+    # 域随机化：每次 reset 采样一组新参数
+    # ------------------------------------------------------------
+    def _apply_randomization(self):
+        cfg = self.rand_cfg
+        rng = self.np_random
+
+        # ① 地面摩擦
+        fric = rng.uniform(*cfg.friction_range)
+        self.model.geom_friction[self._floor_geom_id, 0] = fric
+
+        # ② 机身质量（只改 base_link；腿部质量保持标称）
+        m_scale = rng.uniform(*cfg.base_mass_range)
+        self.model.body_mass[self._base_body_id] = \
+            self._nom_body_mass[self._base_body_id] * m_scale
+
+        # ③ PD 增益
+        #    position actuator：gainprm[:,0]=kp，biasprm[:,1]=-kp，biasprm[:,2]=-kv
+        kp_scale = rng.uniform(*cfg.kp_scale_range)
+        kv_scale = rng.uniform(*cfg.kv_scale_range)
+        self.model.actuator_gainprm[:, 0] = self._nom_gainprm[:, 0] * kp_scale
+        self.model.actuator_biasprm[:, 1] = self._nom_biasprm[:, 1] * kp_scale
+        self.model.actuator_biasprm[:, 2] = self._nom_biasprm[:, 2] * kv_scale
+
+        # ④ 初始状态扰动
+        # base 高度 / 姿态
+        self.data.qpos[2] = rng.uniform(*cfg.init_base_z_range)
+        rpy0 = rng.uniform(-cfg.init_rpy_noise, cfg.init_rpy_noise, size=3)
+        self.data.qpos[3:7] = self._rpy_to_quat(rpy0)
+        # 关节位置：加扰后 clip 回关节限位（jnt_range 第 0 行是 freejoint，跳过）
+        self.data.qpos[7:] += rng.uniform(
+            -cfg.init_joint_noise, cfg.init_joint_noise, size=12
+        )
+        lo = self.model.jnt_range[1:, 0]
+        hi = self.model.jnt_range[1:, 1]
+        self.data.qpos[7:] = np.clip(self.data.qpos[7:], lo, hi)
+        # 初始速度
+        self.data.qvel[0:3] = rng.uniform(
+            -cfg.init_base_vel_noise, cfg.init_base_vel_noise, size=3
+        )
+        self.data.qvel[3:6] = rng.uniform(
+            -cfg.init_base_vel_noise, cfg.init_base_vel_noise, size=3
+        )
+        self.data.qvel[6:] = rng.uniform(
+            -cfg.init_jointvel_noise, cfg.init_jointvel_noise, size=12
+        )
+
+    def _sample_delay(self) -> int:
+        """采样本局动作延迟（策略步）；DR 关闭时恒为 0"""
+        if not self.rand_cfg.enabled:
+            return 0
+        lo, hi = self.rand_cfg.action_delay_range
+        return int(self.np_random.integers(int(lo), int(hi) + 1))
 
     # ------------------------------------------------------------
     # 运动学：世界系状态 + 投影到 base 机身系（50Hz 每 policy step 算一次）
@@ -170,7 +315,7 @@ class DogEnv(gym.Env):
           - 0.001 × Σ (action - last_action)²     # 抖动惩罚
           + 0.5  × upright_bonus                  # 别摔倒（roll,pitch<0.4）
         """
-        # 前进速度：机身系 vx。狗转向后"前进"语义仍正确（Step 3 改）
+        # 前进速度：机身系 vx。狗转向后"前进"语义仍正确
         forward_x_speed = float(kin["lin_vel_base"][0])
 
         # 能耗（action 已 clip 到 [-1,1]）
@@ -218,8 +363,22 @@ class DogEnv(gym.Env):
         yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
         return np.array([roll, pitch, yaw])
 
+    @staticmethod
+    def _rpy_to_quat(rpy: np.ndarray) -> np.ndarray:
+        """[roll, pitch, yaw]（弧度）→ 四元数 [w, x, y, z]，_quat_to_rpy 的逆"""
+        r, p, y = rpy
+        cr, sr = np.cos(r * 0.5), np.sin(r * 0.5)
+        cp, sp = np.cos(p * 0.5), np.sin(p * 0.5)
+        cy, sy = np.cos(y * 0.5), np.sin(y * 0.5)
+        return np.array([
+            cr * cp * cy + sr * sp * sy,  # w
+            sr * cp * cy - cr * sp * sy,  # x
+            cr * sp * cy + sr * cp * sy,  # y
+            cr * cp * sy - sr * sp * cy,  # z
+        ])
+
     def _get_obs(self):
-        """构造 58 维观测（布局见模块 docstring）"""
+        """构造 58 维观测（布局见模块 docstring）；DR 开启时叠加传感器噪声"""
         kin = self._get_kinematics()
         obs = np.concatenate([
             [kin["base_z"]],                 #  0   base z（世界系）
@@ -231,6 +390,9 @@ class DogEnv(gym.Env):
             self._last_action,               # 34:46 上一步动作
             self.Q_DEFAULT,                  # 46:58 默认偏置常量
         ])
+        if self.rand_cfg.enabled and self.rand_cfg.obs_noise_scale > 0:
+            obs = obs + _OBS_NOISE_STD * self.rand_cfg.obs_noise_scale \
+                       * self.np_random.standard_normal(self.OBS_DIM)
         return obs.astype(np.float32)
 
     def render(self):
@@ -251,12 +413,12 @@ class DogEnv(gym.Env):
 
 
 # ============================================================
-# 自检：零策略跑满 1000 个 policy step（20s 仿真），打印 base z
+# 自检：标称环境（关 DR）零策略跑满 1000 step，打印 base z
 # 直接 `python dog_env.py` 运行
 # 期望：base_z 始终 > 0.25m，狗不塌；观测为 58 维
 # ============================================================
 if __name__ == "__main__":
-    env = DogEnv()
+    env = DogEnv(rand_config=RandConfig(enabled=False))
     obs, info = env.reset()
     print(f"[reset] base_z = {info['base_z']:.4f} m （站立目标 ≈ 0.27m）")
     print(f"[reset] obs {obs.shape[0]} 维")

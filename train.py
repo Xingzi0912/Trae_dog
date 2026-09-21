@@ -1,57 +1,103 @@
-"""训练入口：DogEnv + 自实现 PPO（Step 3）
+"""训练入口：DogEnv（域随机化）+ 自实现 PPO（多环境并行采样）
 
 用法：
-    python train.py                # 1M 步 sanity check（PPOConfig 默认）
-    python train.py 20480          # 冒烟：10 批 + 1 次评估，验证管线
-    python train.py 20000000       # 指定总步数（Step 5 长训）
+    python train.py                  # 单环境 1M 步 sanity check
+    python train.py 20480            # 冒烟：约 10 批
+    python train.py 20000000 8       # 8 路并行，20M 步（Step 5 长训）
+
+参数：
+    argv[1] total_steps   总环境步数（默认 1,000,000）
+    argv[2] n_envs        并行环境数（默认 1；>1 用 AsyncVectorEnv 多进程）
+
+每批规模：
+    n_envs=1：2048 步/批；n_envs>1：每环境 512 步（如 8 env → 4096 转移/批）
+    必须能被 minibatch(64) 整除（已自检）。
 
 产物：
-    checkpoints/dog_ppo_best.pt    评估 mean 新高即存
+    checkpoints/dog_ppo_best.pt    评估 mean 新高即存（含 obs_rms 统计量）
     checkpoints/dog_ppo_final.pt   训练结束权重
     logs/dog_ppo_curve.png         学习曲线（训练窗 vs 评估 + V 探针）
 
-说明：Step 3.1 已提前接入 obs 归一化（RunningMeanStd，原 Step 4 内容），
-域随机化仍在 Step 4。1M 步验证 reward 曲线与护栏指标。
+说明：
+    - DR 默认开启，评估也走 DR（10 局不同 seed → eval std 非零，更真实）
+    - lr 衰减按 anneal_steps（默认=total_steps）；长短实验如需公平对比可显式指定
 """
 
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from envs.dog_env import DogEnv
+from envs.dog_env import DogEnv, RandConfig
 from algos.networks import PolicyNetwork, ValueNetwork
-from algos.ppo import (PPOConfig, collect_rollout, compute_gae, update_ppo,
-                       evaluate, set_learning_rate)
+from algos.ppo import (PPOConfig, collect_rollout_vec, compute_gae_vec,
+                       update_ppo, evaluate, set_learning_rate)
 from utils.normalizer import RunningMeanStd
 
 
-def train(total_steps: int = None):
+def make_dog_env(seed: int, rand_cfg: RandConfig = None):
+    """模块级环境工厂（AsyncVectorEnv spawn 要求 thunk 可 pickle，
+    闭包在 Windows 上不可 pickle，故放模块级）。"""
+    if rand_cfg is None:
+        rand_cfg = RandConfig()
+    env = DogEnv(rand_config=rand_cfg)
+    env.reset(seed=seed)
+    env.action_space.seed(seed)
+    return env
+
+
+def make_vector_env(n_envs: int, base_seed: int, rand_cfg: RandConfig):
+    """n_envs=1 用 SyncVectorEnv；>1 用 AsyncVectorEnv。
+
+    autoreset 用 SAME_STEP（旧版语义：done 当步返回新局初态、终态放
+    infos['final_obs']），PPO 的 done/reset 记账最直接。老版本 gymnasium
+    不支持 autoreset_mode 参数时静默回退。
+    """
+    from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv, AutoresetMode
+    thunks = [partial(make_dog_env, seed=base_seed + i, rand_cfg=rand_cfg)
+              for i in range(n_envs)]
+    cls = SyncVectorEnv if n_envs == 1 else AsyncVectorEnv
+    try:
+        return cls(thunks, autoreset_mode=AutoresetMode.SAME_STEP)
+    except (TypeError, AttributeError):
+        return cls(thunks)
+
+
+def train(total_steps: int = None, n_envs: int = 1):
     cfg = PPOConfig()
     if total_steps is not None:
         cfg.total_steps = total_steps
+    cfg.n_envs = n_envs
+    # 多环境时每环境 512 步/批（batch=512×N）；单环境保持 2048
+    cfg.steps_per_env = 2048 if n_envs == 1 else 512
+    batch_total = cfg.steps_per_batch
+    assert batch_total % cfg.minibatch == 0, \
+        f"batch {batch_total} 不能被 minibatch {cfg.minibatch} 整除"
 
-    # --- 可复现性：env / numpy / torch 三处种子 ---
-    env = DogEnv()
-    env.reset(seed=cfg.seed)
-    env.action_space.seed(cfg.seed)
+    # --- 可复现性：numpy / torch 种子（各 env 种子在工厂内单独设） ---
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    state_dim = env.observation_space.shape[0]   # 58
-    action_dim = env.action_space.shape[0]       # 12
-    assert state_dim == 58 and action_dim == 12
+    dr_cfg = RandConfig()
+    venv = make_vector_env(cfg.n_envs, cfg.seed, dr_cfg)
+    obs, _ = venv.reset(seed=[cfg.seed + i for i in range(cfg.n_envs)])
+
+    state_dim = obs.shape[1]              # 58
+    action_dim = 12
+    assert state_dim == 58
 
     actor = PolicyNetwork(state_dim, action_dim).to(cfg.device)
     critic = ValueNetwork(state_dim).to(cfg.device)
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
     critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.lr)
-    print(f"设备: {cfg.device} | 目标 {cfg.total_steps:,} 步")
+    print(f"设备: {cfg.device} | 目标 {cfg.total_steps:,} 步 | "
+          f"{cfg.n_envs} 环境并行（{batch_total} 转移/批）")
     print(f"Actor 参数 {sum(p.numel() for p in actor.parameters()):,} | "
           f"Critic 参数 {sum(p.numel() for p in critic.parameters()):,}")
-    print(f"策略 50Hz（frame_skip=10）| 单局 1000 step = 20s")
+    print(f"策略 50Hz（frame_skip=10）| 单局 1000 step = 20s | 域随机化: 开")
     print()
 
     Path("checkpoints").mkdir(exist_ok=True)
@@ -62,7 +108,6 @@ def train(total_steps: int = None):
 
     probe_states = None          # V 探针：第 1 批冻结 256 个【归一化】状态
     best_score = -float("inf")
-    obs, _ = env.reset(seed=cfg.seed)
 
     history = {"step": [], "train_mean": [], "eval_mean": [],
                "eval_std": [], "v_probe": []}
@@ -71,33 +116,40 @@ def train(total_steps: int = None):
     batch_no = 0
     train_start = time.time()
 
+    # lr 衰减时长（与 total_steps 解耦；默认两者相同）
+    anneal_denom = cfg.anneal_steps or cfg.total_steps
+    # 评估批次间隔（batch 数；不整除时四舍五入）
+    eval_every = max(1, round(cfg.eval_interval / batch_total))
+
     while total_steps_done < cfg.total_steps:
-        # 学习率线性衰减：起点 cfg.lr，终点 0（按剩余步数比例）
+        # 学习率线性衰减：起点 cfg.lr，终点 0
         if cfg.anneal_lr:
-            frac = 1.0 - total_steps_done / cfg.total_steps
+            frac = max(0.0, 1.0 - total_steps_done / anneal_denom)
             set_learning_rate(actor_opt, cfg.lr * frac)
             set_learning_rate(critic_opt, cfg.lr * frac)
 
         batch_t0 = time.time()
-        buf, info = collect_rollout(env, actor, critic, obs, cfg, obs_rms)
+        buf, info = collect_rollout_vec(venv, actor, critic, obs, cfg, obs_rms)
         obs = info["next_obs"]
-        advantages, returns = compute_gae(buf, critic, cfg)
+        advantages, returns = compute_gae_vec(buf, critic, cfg)
         stats = update_ppo(actor, critic, actor_opt, critic_opt,
                            buf, advantages, returns, cfg)
         batch_dt = time.time() - batch_t0
 
         if probe_states is None:
-            probe_states = torch.as_tensor(
-                np.asarray(buf["obs"])[:256], dtype=torch.float32, device=cfg.device)
+            flat_obs = torch.as_tensor(buf["obs"].reshape(-1, state_dim),
+                                       dtype=torch.float32, device=cfg.device)
+            probe_states = flat_obs[:256]
 
-        total_steps_done += cfg.steps_per_batch
+        total_steps_done += batch_total
         batch_no += 1
         window_scores.extend(info["ep_scores"])
 
-        do_eval = batch_no % (cfg.eval_interval // cfg.steps_per_batch) == 0
+        do_eval = batch_no % eval_every == 0
         is_last = total_steps_done >= cfg.total_steps
         if do_eval or is_last:
-            ev = evaluate(actor, DogEnv, cfg, obs_rms=obs_rms)
+            eval_factory = partial(make_dog_env, seed=0, rand_cfg=dr_cfg)
+            ev = evaluate(actor, eval_factory, cfg, obs_rms=obs_rms)
             with torch.no_grad():
                 v_probe = critic(probe_states).mean().item()
             train_mean = float(np.mean(window_scores)) if window_scores else float("nan")
@@ -118,7 +170,7 @@ def train(total_steps: int = None):
                 f"kl {stats['approx_kl']:.4f} H {stats['entropy']:5.2f} "
                 f"V探 {v_probe:7.1f} vloss {stats['critic_loss']:8.1f} | "
                 f"{sps:,.0f} step/s 批{batch_dt:.1f}s {stop_flag}"
-                f"({stats['n_updates']}/128)"
+                f"({stats['n_updates']}/{stats['max_updates']})"
             )
             print(f"           σ = {np.array2string(sigma, precision=3, separator=', ')}")
 
@@ -135,7 +187,7 @@ def train(total_steps: int = None):
                             "obs_rms": obs_rms.state_dict()},
                            "checkpoints/dog_ppo_best.pt")
 
-    env.close()
+    venv.close()
     torch.save({"actor": actor.state_dict(),
                 "obs_rms": obs_rms.state_dict()},
                "checkpoints/dog_ppo_final.pt")
@@ -164,7 +216,7 @@ def plot_history(history):
     ax1.axhline(500, color="orange", linewidth=0.8, linestyle="--",
                 label="zero-policy baseline ≈500")
     ax1.set_ylabel("episode return")
-    ax1.set_title("PPO DogEnv (58-dim obs, 50Hz, position control)")
+    ax1.set_title("PPO DogEnv (58-dim obs, 50Hz, position control, domain rand)")
     ax1.legend()
     ax1.grid(alpha=0.3)
 
@@ -180,4 +232,5 @@ def plot_history(history):
 
 if __name__ == "__main__":
     total = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    train(total)
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    train(total, n)
