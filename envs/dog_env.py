@@ -77,6 +77,9 @@ class DogEnv(gym.Env):
         self._max_steps = 1000
         self._step_count = 0
 
+        # 上一步动作（reward 抖动惩罚需要；reset 时重置）
+        self._last_action = np.zeros(12, dtype=np.float64)
+
         self._renderer = None
 
     def reset(self, seed=None, options=None):
@@ -85,6 +88,7 @@ class DogEnv(gym.Env):
         mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key_id)
         mujoco.mj_forward(self.model, self.data)
         self._step_count = 0
+        self._last_action = np.zeros(12, dtype=np.float64)  # 抖动惩罚基准
         obs = self._get_obs()
         info = {"base_z": float(self.data.xpos[self._base_body_id, 2])}
         return obs, info
@@ -101,9 +105,72 @@ class DogEnv(gym.Env):
         base_z = float(self.data.xpos[self._base_body_id, 2])
         terminated = base_z < self._z_terminate
         truncated = self._step_count >= self._max_steps
-        reward = 0.0  # Step 1 不实现 reward
-        info = {"base_z": base_z, "step": self._step_count}
+        reward, reward_info = self._compute_reward(action)
+        info = {"base_z": base_z, "step": self._step_count, **reward_info}
+        # 更新上一步动作（必须放在 _compute_reward 之后，否则抖动惩罚会用错基准）
+        self._last_action = action.copy()
         return obs, reward, terminated, truncated, info
+
+    def _compute_reward(self, action: np.ndarray) -> tuple[float, dict]:
+        """reward 4 分量（agents.md 第 113-118 行）
+
+        r = +1.0  × forward_x_speed              # 前进速度（主目标）
+          - 0.05 × Σ action²                      # 能耗惩罚
+          - 0.001 × Σ (action - last_action)²     # 抖动惩罚
+          + 0.5  × upright_bonus                  # 别摔倒（roll,pitch<0.4）
+
+        Step 2 阶段：obs 维度暂未扩展，reward 内部直接从 data 读状态，
+        不依赖 obs 数组。Step 3 接 PPO 时再统一 obs 48 维规范化。
+        """
+        # 前进速度：base 线速度 x 分量（世界系，keyframe home 时 qvel[0]=0）
+        # Step 2 验证阶段狗不转向，世界系 = base 系；Step 3 再投影到 base 系
+        forward_x_speed = float(self.data.qvel[0])
+
+        # 能耗（action 已 clip 到 [-1,1]）
+        action_sq_sum = float(np.sum(action ** 2))
+
+        # 抖动（与上一步动作差）
+        action_diff = action - self._last_action
+        action_diff_sq_sum = float(np.sum(action_diff ** 2))
+
+        # 姿态：四元数 → roll, pitch（MuJoCo quat 顺序 [w, x, y, z]）
+        quat = self.data.qpos[3:7]
+        roll, pitch, _ = self._quat_to_rpy(quat)
+        upright = 1.0 if (abs(roll) < 0.4 and abs(pitch) < 0.4) else 0.0
+
+        r_forward = 1.0 * forward_x_speed
+        r_energy = -0.05 * action_sq_sum
+        r_jerk = -0.001 * action_diff_sq_sum
+        r_upright = 0.5 * upright
+        reward = r_forward + r_energy + r_jerk + r_upright
+
+        info = {
+            "reward_forward": r_forward,
+            "reward_energy": r_energy,
+            "reward_jerk": r_jerk,
+            "reward_upright": r_upright,
+            "forward_x_speed": forward_x_speed,
+            "roll": float(roll),
+            "pitch": float(pitch),
+            "upright": upright,
+        }
+        return reward, info
+
+    @staticmethod
+    def _quat_to_rpy(quat: np.ndarray) -> np.ndarray:
+        """四元数 [w, x, y, z] → [roll, pitch, yaw]（ZYX 顺序，弧度）
+
+        标准 ZYX 欧拉角分解，机器狗只关心 roll/pitch（pitch=前后倾，roll=左右倾）。
+        yaw 用于转向（trot 直行时不重要）。
+        """
+        w, x, y, z = quat
+        # roll 绕 x 轴
+        roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        # pitch 绕 y 轴（asin 有数值范围限制，需 clip）
+        pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+        # yaw 绕 z 轴
+        yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        return np.array([roll, pitch, yaw])
 
     def _get_obs(self):
         # Step 1 占位：直接返回 qpos。Step 2 改成 48 维完整观测。
