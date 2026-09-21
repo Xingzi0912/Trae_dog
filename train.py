@@ -10,8 +10,8 @@
     checkpoints/dog_ppo_final.pt   训练结束权重
     logs/dog_ppo_curve.png         学习曲线（训练窗 vs 评估 + V 探针）
 
-说明：Step 3 不含 obs 归一化 / 域随机化（Step 4），1M 步只验证
-reward 曲线、护栏指标与基线（零策略单局 ≈ +500）相比是否上行。
+说明：Step 3.1 已提前接入 obs 归一化（RunningMeanStd，原 Step 4 内容），
+域随机化仍在 Step 4。1M 步验证 reward 曲线与护栏指标。
 """
 
 import sys
@@ -23,7 +23,9 @@ import torch
 
 from envs.dog_env import DogEnv
 from algos.networks import PolicyNetwork, ValueNetwork
-from algos.ppo import PPOConfig, collect_rollout, compute_gae, update_ppo, evaluate
+from algos.ppo import (PPOConfig, collect_rollout, compute_gae, update_ppo,
+                       evaluate, set_learning_rate)
+from utils.normalizer import RunningMeanStd
 
 
 def train(total_steps: int = None):
@@ -55,7 +57,10 @@ def train(total_steps: int = None):
     Path("checkpoints").mkdir(exist_ok=True)
     Path("logs").mkdir(exist_ok=True)
 
-    probe_states = None          # V 探针：第 1 批冻结 256 个状态
+    # obs 在线归一化（随 checkpoint 一起保存，部署时必须用同一统计量）
+    obs_rms = RunningMeanStd(shape=(state_dim,))
+
+    probe_states = None          # V 探针：第 1 批冻结 256 个【归一化】状态
     best_score = -float("inf")
     obs, _ = env.reset(seed=cfg.seed)
 
@@ -67,8 +72,14 @@ def train(total_steps: int = None):
     train_start = time.time()
 
     while total_steps_done < cfg.total_steps:
+        # 学习率线性衰减：起点 cfg.lr，终点 0（按剩余步数比例）
+        if cfg.anneal_lr:
+            frac = 1.0 - total_steps_done / cfg.total_steps
+            set_learning_rate(actor_opt, cfg.lr * frac)
+            set_learning_rate(critic_opt, cfg.lr * frac)
+
         batch_t0 = time.time()
-        buf, info = collect_rollout(env, actor, critic, obs, cfg)
+        buf, info = collect_rollout(env, actor, critic, obs, cfg, obs_rms)
         obs = info["next_obs"]
         advantages, returns = compute_gae(buf, critic, cfg)
         stats = update_ppo(actor, critic, actor_opt, critic_opt,
@@ -86,7 +97,7 @@ def train(total_steps: int = None):
         do_eval = batch_no % (cfg.eval_interval // cfg.steps_per_batch) == 0
         is_last = total_steps_done >= cfg.total_steps
         if do_eval or is_last:
-            ev = evaluate(actor, DogEnv, cfg)
+            ev = evaluate(actor, DogEnv, cfg, obs_rms=obs_rms)
             with torch.no_grad():
                 v_probe = critic(probe_states).mean().item()
             train_mean = float(np.mean(window_scores)) if window_scores else float("nan")
@@ -101,11 +112,13 @@ def train(total_steps: int = None):
                 f"评估 {ev['mean']:7.1f}±{ev['std']:5.1f} "
                 f"[{ev['min']:7.1f},{ev['max']:7.1f}]"
             )
+            stop_flag = "KL停" if stats["kl_stop"] else "    "
             print(
                 f"           clip {stats['clip_frac']*100:4.1f}% "
                 f"kl {stats['approx_kl']:.4f} H {stats['entropy']:5.2f} "
                 f"V探 {v_probe:7.1f} vloss {stats['critic_loss']:8.1f} | "
-                f"{sps:,.0f} step/s 批{batch_dt:.1f}s"
+                f"{sps:,.0f} step/s 批{batch_dt:.1f}s {stop_flag}"
+                f"({stats['n_updates']}/128)"
             )
             print(f"           σ = {np.array2string(sigma, precision=3, separator=', ')}")
 
@@ -118,10 +131,14 @@ def train(total_steps: int = None):
 
             if ev["mean"] > best_score:
                 best_score = ev["mean"]
-                torch.save(actor.state_dict(), "checkpoints/dog_ppo_best.pt")
+                torch.save({"actor": actor.state_dict(),
+                            "obs_rms": obs_rms.state_dict()},
+                           "checkpoints/dog_ppo_best.pt")
 
     env.close()
-    torch.save(actor.state_dict(), "checkpoints/dog_ppo_final.pt")
+    torch.save({"actor": actor.state_dict(),
+                "obs_rms": obs_rms.state_dict()},
+               "checkpoints/dog_ppo_final.pt")
     print(f"\n训练结束，最佳评估均值 = {best_score:.1f}，checkpoint 已存 checkpoints/")
 
     plot_history(history)
