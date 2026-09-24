@@ -44,6 +44,9 @@ Step 4 域随机化（每次 reset 重新采样，见 RandConfig）：
     obs, r, term, trunc, info = env.step(np.zeros(12))
 """
 
+# 兼容 NUC Ubuntu 20.04 自带 Python 3.8：注解延迟求值（tuple[float,...] 等 PEP585 语法）
+from __future__ import annotations
+
 from dataclasses import dataclass
 from collections import deque
 
