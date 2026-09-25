@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+# 例外：随仓库分发的 DM SDK 原生后端
+!deploy/dlls/*.so
 .Python
 
 # 虚拟环境（复用 d:/data/Trae/deep-learning/.venv，本目录内不应有 venv）
