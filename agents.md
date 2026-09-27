@@ -157,6 +157,148 @@ r = +1.0  × forward_x_speed            # 前进速度（主目标）
 
 ---
 
+## 决策 5：指令条件策略（手柄遥控 vx/vy/yaw）+ 61 维新观测（2026-09-26 冻结）
+
+**背景**：58 维模型（9/22 checkpoint）只会自主向前，无控制语义，不作为部署候选。
+新模型接收速度指令，训练后实机用手柄遥控前进/横移/转向/停车。**旧 58 维
+checkpoint 不兼容，从头训，不覆盖旧文件**（新模型命名 `dog_cmd_mjx_*`）。
+
+### 5.1 观测布局：58 → 61 维（含 projected gravity 改造）
+
+姿态观测 **obs[1:4] 从 rpy 改为 projected gravity**（重力向量在机身系投影）：
+BMI088 为 6 轴 IMU，EKF 无磁力计修正，yaw 纯陀螺积分必漂移（静止 0.013rad/s
+→ 20s 漂 0.1~0.3rad）。projected gravity 数学上不含 yaw，漂移天然免疫；
+转向跟踪用 gyro ωz（obs[9]，无漂移）+ yaw_rate 指令即可。FK 估计器高度公式
+只用 R 第三行、速度全在机身系，不依赖 yaw，改动无副作用。
+
+| 索引    | 量（全部机身系，除 base_z）                | 仿真来源                | 实机来源                                 |
+| ------- | ------------------------------------------ | ----------------------- | ---------------------------------------- |
+| [0]     | base_z（世界系高度）                       | xpos[base].z            | FK 估计器（支撑脚约束，已验证 0.3mm）    |
+| [1:4]   | **projected gravity g_b**（站立≈[0,0,-1]） | Rᵀ·[0,0,-1]             | IMU 四元数算 Rᵀ·[0,0,-1]（yaw 丢弃）     |
+| [4:7]   | 机身系线速度 vx/vy/vz                      | Rᵀ·qvel[0:3]            | FK 估计器（动态误差 2.3cm/s）            |
+| [7:10]  | 机身系角速度                               | Rᵀ·qvel[3:6]            | IMU gyro 直出（rad/s）                   |
+| [10:22] | 12 关节角（**sim 系**）                    | qpos[7:]                | pos16 反馈 → **real→sim 逆映射**         |
+| [22:34] | 12 关节速度（**sim 系**）                  | qvel[6:]                | vel12 → S×dq_real + 一阶轻低通(~20Hz)    |
+| [34:46] | last_action                                | 缓存上帧输出            | 同（自身已知量）                         |
+| [46:58] | q_default 常量                             | **固定** [0,0.9,-1.8]×4 | **必须填同一仿真常量**，禁止填实机标定值 |
+| [58:61] | **指令 [vx_cmd, vy_cmd, yaw_rate_cmd]**    | 训练随机采样            | 手柄（单位 m/s, m/s, rad/s）             |
+
+实机关节反馈逆映射（run_policy.py 必须实现，记忆此前只有正向动作映射）：
+
+```
+q_sim[i]  = q_default_sim[i] + S[i] × (q_real[i] − q_default_real_eff[i])
+dq_sim[i] = S[i] × dq_real[i]
+```
+
+`q_default_real_eff` = stance_calibration 零偏折叠 posture_trim（仅小腿）后的
+有效零偏。数据流顺序：**反馈 → 逆映射 → FK + 拼 obs**，不能反。
+vel12 量化分辨率 ~0.022rad/s，远小于 DR 噪声 0.15，量级安全。
+
+### 5.2 指令采样与三段课程（仿真训练）
+
+最终分布：vx∈[-0.5,+1.5]、vy∈[-0.5,+0.5]、yaw_rate∈[-2.0,+2.0]（单位
+m/s、rad/s）；每次采样 **15~20% 概率给零指令**（显式学习停车站立）；
+episode 内每 **2~4s 重采样**一次（学习中途切换方向，用 scan carry 实现）。
+
+| 阶段 | vx          | vy          | yaw_rate    |
+| ---- | ----------- | ----------- | ----------- |
+| 初期 | [0, 0.8]    | 0           | [-0.5, 0.5] |
+| 中期 | [-0.3, 1.2] | [-0.3, 0.3] | [-1.5, 1.5] |
+| 末期 | [-0.5, 1.5] | [-0.5, 0.5] | [-2.0, 2.0] |
+
+切换步数等冒烟 + 1~2M 步曲线后标定。
+
+### 5.3 奖励（替换旧 forward 分量；速度跟踪为主导信号）
+
+```python
+r = 1.0 * exp(-(vx_err² + vy_err²) / 0.25)   # 线速度跟踪（机身系）
+  + 0.5 * exp(-(yaw_err²) / 0.25)            # 转向跟踪
+  + 0.5 * upright                            # |g_x|,|g_y| < sin(0.4)≈0.39 时=1（与旧阈值等价）
+  - 0.05 * Σ action²                          # 能耗
+  - 0.01 * Σ (action-last_action)²            # 抖动（旧债 0.001→0.01）
+  - 1.0  * vz_body²                           # 抑制上下颠
+  - 0.05 * (ωx² + ωy²)                        # 抑制 roll/pitch 抖动（小权重，防"不动最稳"）
+```
+
+教训（经验库）：稳定/平滑项权重不得喧宾夺主，否则策略收敛静止退化解；
+v1 **不加** foot airtime / 步态相位奖励，不硬编码 trot。终止条件不变
+（z<0.25，1000 步截断）。DR 中 [1:4] 噪声从 rpy 0.01rad 改为重力向量
+分量噪声 0.02~0.05；去掉 yaw 漂移项。
+
+### 5.4 评估（脚本化指令序列，替代只看 episode return）
+
+站立2s → 直行 vx=0.8（4s）→ 走转 vx=0.5/yaw=0.8（4s）→ 刹车停2s →
+横移/后退段；10 种子。指标：各段速度 RMSE、姿态角、是否摔倒。
+初定阈值：直行 vx RMSE<0.2、yaw RMSE<0.3、松指令 2s 内停稳；训完校准。
+成功基线：评估均值 ≥1500 且 10 种子最低 ≥800 + 视觉步态自然（沿用旧标准）。
+
+---
+
+## 决策 6：GPU 训练走 MJX（JAX），不用 Isaac/PhysX（2026-09-26 冻结）
+
+- **瓶颈是 MuJoCo 物理（mj_step 仅 CPU），不是网络**（actor 仅 30 万参数）。
+  单改 `.to(cuda)` 无提速；CPU 20env ≈140 step/s，20M 步 ~40h。
+- 选 **MuJoCo MJX（JAX）**：加载同一 MJCF，位置 PD/摩擦/DR 调参成果同源保留，
+  sim-to-real 一致性远好于换 PhysX（Isaac Lab/Genesis 否，等于换项目）。
+- 目标 2048 env 起（4090，按吞吐/显存调 4096），预期 3万~8万 step/s，
+  20M 步分钟级。**训练机 = 4090 Linux 服务器**（pip jax[cuda12]+mujoco-mjx+flax）。
+- **PPO 用 Flax 自己写**（沿用决策2"自实现可控"）：GAE 按 env 分离、
+  done mask/bootstrap、KL 早停 0.02~0.03、lr 从 anneal_steps 独立衰减、
+  熵系数 0.003、obs_rms 归一化；rollout/minibatch 尺寸按大批量重标。
+- checkpoint 双存：Flax 原生（续训）+ **部署包 .npz**（MLP 权重 + obs_rms，
+  NUC 端 numpy 矩阵乘推理，无需 JAX）。命名 `checkpoints/dog_cmd_mjx_best.pt/.npz`。
+
+### MJX 移植要点（2026-09-26 阶段 1 已实测，mujoco-mjx 3.13.0 / jax 0.11.2）
+
+- 新建 `envs/dog_mjx.xml` + `envs/scene_mjx.xml`（原文件不动）。
+  本地 venv（Python3.13）装 CPU 版 jax 0.11.2 + **mujoco-mjx==3.13.0**
+  （版本必须与 mujoco 精确一致；阿里云镜像有，清华镜像滞后停在 3.2.2）。
+  注意 TRAE 沙箱默认禁止写 deep-learning venv，pip 需沙箱外执行。
+- **实测的最终适配清单**（探针矩阵 scripts/probe*mjx*\*.py 实证，非猜测）：
+  1. **椭圆锥保留** `cone="elliptic" impratio="100"`——3.13 原生支持，零 warning；
+     改金字塔锥会导致 RR_hip 站立偏 4.7°、base_z 低 1cm（impratio=100 的近零
+     侧向摩擦是点足设定，绝不能丢）
+  2. 积分器加 `integrator="implicitfast"`（与 Euler 站立轨迹实测等价，批量
+     rollout 更稳；CPU 同 XML 同积分器对比）
+  3. **cylinder→capsule 是唯一硬性改动**：`CYLINDER-BOX collisions not
+implemented`（站立即触发自碰撞）；size/pos/quat 原样保留
+  4. **condim=6 保留**（3.13 实测支持；比 condim=3 更贴近原模型站立高度）
+  5. 删除 `<sensor>` 段（训练不用，obs 直接从 data 构造）
+  - frictionloss=0.2 / margin=0.001 / actuatorfrcrange 全部原生支持，零 warning
+- **一致性校验通过**（scripts/verify_mjx_consistency.py，零策略 2s）：
+  引擎差（CPU-MJX vs MJX 同 XML）关节 max 0.187°/base 0.38mm；
+  适配差（原 XML vs MJX-XML，均 CPU）关节 max 0.36°/base 0.21mm；
+  终态 base_z 三者 0.27247/0.27249/0.27250 几乎重合。图 logs/mjx_consistency.png。
+  ⚠️ 仅验证站立；阶段 2 动态步行后需再跑一次动态一致性（capsule 自碰撞
+  包膜在摆腿时差异可能更大）。
+- 新文件 `envs/dog_env_mjx.py`、`algos/ppo_jax.py`、`algos/networks_jax.py`，
+  全部 vmap/scan/jit 化；旧 CPU dog_env.py 保留两个用途：
+  ①MJX 一致性基准 ②训练后加载 npz 权重渲染视频（MJX 离屏渲染麻烦）。
+- 零策略语义/时间尺度不变：q_des=q_default+action×0.25、frame_skip=10、
+  dt=0.002、50Hz；DR（摩擦/质量/kp/kv/初态扰动/动作延迟/观测噪声）全向量化。
+
+### 实施阶段
+
+0. 4090 服务器装 jax[cuda12]/mujoco-mjx/flax，代码 tar 同步
+1. dog_mjx.xml 适配 + mjx.test_model() + **MJX/CPU 动力学一致性校验**
+2. `envs/dog_env_mjx.py`：2048 env 向量化 + 61 维观测 + DR + 指令课程
+3. `algos/ppo_jax.py`/`networks_jax.py`：Flax PPO + 双格式 checkpoint
+4. 指令奖励训练（目标 20M 步）+ 脚本化评估
+5. CPU MuJoCo 加载 npz 渲染验证步态/指令跟踪
+6. 实机 `run_policy.py` + 手柄（训练达标后再写）
+
+### 实机部署（阶段6）手柄与安全
+
+- pygame 读手柄（Xbox/北通类优先）：左摇杆上下=vx、左右=vy；右摇杆左右=yaw；
+  死区 0.1；缩放 1.5/0.5/2.0；指令斜率限制防猛打杆。
+- 安全：使能后默认零指令站稳；**肩键 deadman（按住才放行非零指令，松开停车）**；
+  独立按键急停失能；起立仍走 stand_up.py，站稳再切 run_policy.py。
+- ⚠️ **contact[4] 支撑脚掩码待实现**（实机无力传感器）：优先髋部高度几何法
+  （FK 各脚相对 base 的 z，最低两只判支撑），电流阈值备选；trot 摆动相若
+  全脚判支撑会拉偏 FK 高度/速度，不可省。
+
+---
+
 ## 待办清单（按执行顺序）
 
 ### Step 1：让模型站起来 ⭐ 拦路虎，先验证
@@ -217,20 +359,58 @@ r = +1.0  × forward_x_speed            # 前进速度（主目标）
 | C# 扫描工具          | `d:/data/Trae/robot-dog/scan_tool/Program.cs`           |
 | C# 电机控制 demo     | `d:/data/Trae/robot-dog/sdk/.../CSharp/demo/Program.cs` |
 
-## 实机关节顺序映射（待确认）
+## 实机关节顺序映射（2026-09-25 已确认）
 
 ```
-策略动作 12 维顺序 ↔ (CAN通道, MotorID)
-建议约定 URDF/MJCF 关节顺序：
+策略动作 12 维顺序（URDF/MJCF 关节顺序）：
   [FL_hip, FL_thigh, FL_calf,
    FR_hip, FR_thigh, FR_calf,
    RL_hip, RL_thigh, RL_calf,
    RR_hip, RR_thigh, RR_calf]
 
-实机映射（来自 robot-dog/AGENTS.md）：
-  CH0=RL, CH1=RR, CH2=FL(?), CH3=FR(?)
+实机映射（2026-09-25 用户确认）：
+  CH0=FL(左前), CH1=FR(右前), CH2=RL(左后), CH3=RR(右后)
   MotorID: 髋=0x01, 大腿=0x02, 小腿=0x03
+
+即策略动作 idx → (CH, MotorID)：
+  0 FL_hip   → (CH0, 0x01)    1 FL_thigh → (CH0, 0x02)    2 FL_calf → (CH0, 0x03)
+  3 FR_hip   → (CH1, 0x01)    4 FR_thigh → (CH1, 0x02)    5 FR_calf → (CH1, 0x03)
+  6 RL_hip   → (CH2, 0x01)    7 RL_thigh → (CH2, 0x02)    8 RL_calf → (CH2, 0x03)
+  9 RR_hip   → (CH3, 0x01)   10 RR_thigh → (CH3, 0x02)   11 RR_calf → (CH3, 0x03)
 ```
+
+### 符号矩阵 S（2026-09-26 identify_motors.py 实测）
+
+仿真正方向约定（dog_positional.xml）：髋=向左+，大腿=向后+，小腿=曲腿+（向后摆）。
+
+实机实测正方向 → S = real 相对 sim 的符号：
+
+| 关节 | 实机正方向 | S | | 关节 | 实机正方向 | S |
+| ---- | ---------- | - | | ---- | ---------- | - |
+| FL 髋 | 向左+ | +1 | | FR 髋 | 向左+ | +1 |
+| FL 大腿 | 向后+ | +1 | | FR 大腿 | 向前+ | -1 |
+| FL 小腿 | 曲腿+ | +1 | | FR 小腿 | 曲腿- | -1 |
+| RL 髋 | 向左- | -1 | | RR 髋 | 向左- | -1 |
+| RL 大腿 | 向后+ | +1 | | RR 大腿 | 向后- | -1 |
+| RL 小腿 | 曲腿+ | +1 | | RR 小腿 | 曲腿- | -1 |
+
+按 12 维动作顺序展开：
+`S = [+1,+1,+1,  +1,-1,-1,  -1,+1,+1,  -1,-1,-1]`
+
+部署换算公式：
+`q_des_real[i] = q_default_real[i] + S[i] × (q_des_sim[i] - q_default_sim[i])`
+（q_default_real 来自 deploy/stance_calibration.json，q_default_sim=[0,0.9,-1.8]×4）
+
+### 站立位标定结果（2026-09-26 calibrate_stance.py 实测）
+
+`q_default_real`（策略 12 维顺序，rad）：
+`[+0.1326, +0.7616, +0.0917,  -0.1104, -0.7624, -0.1482,  -0.0856, -2.1639, -0.0933,  -0.0551, -0.5537, -0.0692]`
+
+一致性核对：
+
+- 4 髋 ≈ 0（±0.13 内）✅；4 小腿隐含零偏左右镜像整齐（左 ≈+1.8 / 右 ≈-1.9）✅
+- 大腿 FL/FR/RR 按 S 折算 ≈ +0.55~0.76 ✅
+- ⚠️ RL_thigh = -2.16，与同号的 FL_thigh(+0.76) 差 2.9 rad ≈ 166°，判定为该电机装配零偏不同（q_default_real 已吸收，不影响部署）；站立测试时重点观察左后腿
 
 ---
 
@@ -345,3 +525,70 @@ clip/kl 是否回落、σ 是否健康分化。
   本地 20,480 步重测通过（结果与绝对路径版完全一致 487.8）。
 - 部署目标：服务器 i9-14900K + RTX 4090（CUDA 12.8 驱动），克隆到
   ~/Sxy_bigdog/Trae_dog，独立 venv + cu128 torch。
+
+### 2026-09-26 — 实机标定与站立测试
+
+- 符号矩阵 S 实测完成（identify_motors.py）：`S=[+1,+1,+1, +1,-1,-1, -1,+1,+1, -1,-1,-1]`，详见上方映射节
+- 站姿标定完成（calibrate_stance.py stance → deploy/stance_calibration.json），
+  一致性核对通过；⚠️ RL_thigh 零偏与其他腿差 ≈2.9 rad（装配零偏，q_default_real 已吸收）
+- 站立保持测试通过（stand_hold.py，146s 无发散）：kp=60 时小腿静差 ≈0.12 rad 偏软，
+  实机需 kp=100（高于仿真值属允许方向）；stand_hold.py 支持命令行 kp/kd 参数
+- calibrate_stance.py 加名称参数（stance/lie）+ 无反馈拒绝保存保护 + 轮询 5 轮
+- 趴姿标定完成（lie → deploy/lie_calibration.json，12 台全到位，左右对称性 ✅）
+- 新建 stand_up.py：趴姿→(Enter)→10s 余弦平滑起立→站姿保持→(Enter)→10s 趴下→失能，
+  单人免扶狗操作；Ctrl+C 为应急立即失能（狗会摔）
+- 站立调平完成（stand_up.py STAND 阶段在线微调）：实机初始标定存在前高后低，
+  经微调确认后腿小腿需抬高 `trim_rear=+0.1 rad`（仿真系），前腿 `trim_front=0.0`。
+  参数固化到 deploy/posture_trim.json，部署时折叠进零偏：
+  `q_default_eff[i] = q_default_real[i] + S[i] * (-trim)（仅小腿关节）`。
+- 调平姿态复现确认（kp=150/kd=2，STAND 阶段，用户目视水平 ✅）：
+  稳态误差髋/大腿 ≤0.064 rad，小腿残差 0.036~0.114 rad（最大 RR_calf），
+  小腿误差不随 kp 增大缩小（力矩/电压上限迹象）。误差网格已存档进
+  posture_trim.json 的 validation 字段，作为部署站立基线参考。
+- stand_up.py 升级：启动自动加载 deploy/posture_trim.json 作为初始微调
+  （load_trim()），起立即达调平姿态，无需再手动输 `r 0.1`；r/f 在线微调
+  在此基础叠加；启动/退出打印含初始加载量。
+- 教训：JSON 数字不允许前导 `+` 号（`+0.0359` 触发 JSONDecodeError），
+  posture_trim.json 曾因此在 NUC 解析失败（崩溃发生在使能电机前，无风险），
+  已修复。
+- NUC 网络变更：原 192.168.1.100 已失效，新地址 192.168.155.27（2026-09-26 用户确认）。
+  NUC 关机后无法连接属正常，下次部署前先确认开机并 `hostname -I` 核对。
+- ✅ 已解决（2026-09-26 用户确认）：修复版（无 `+` 号）posture_trim.json 已重新同步到
+  NUC，stand_up.py 运行正常，无需再执行 sed 修复。
+
+### 2026-09-26 — 新方向冻结：指令条件策略 + MJX GPU 训练（决策 5/6）
+
+- 9/22 的 58 维模型仅会自主前进、无控制语义，用户决定**不作为部署候选**；
+  新目标 = 手柄遥控（vx/vy/yaw_rate 三维全向指令，含后退/原地转/停车）。
+- 61 维观测布局与实机传感器逐维核对完成（见决策 5.1 对照表）：全部有信号
+  来源，但发现并定案 4 项：
+  1. **obs[1:4] rpy → projected gravity**（BMI088 无磁力计，yaw 必漂移）；
+  2. 关节反馈 real→sim 逆映射公式定案（run_policy.py 待实现）；
+  3. 关节速度 S×dq_real + ~20Hz 低通；
+  4. obs[46:58] 实机必须固定填仿真常量 [0,0.9,-1.8]×4。
+- 训练后端：CPU 20env 的瓶颈是 mj_step（非网络），定案 **MJX/JAX 重写**
+  （非 Isaac/PhysX，保 MuJoCo 同源动力学），4090 Linux 服务器训练，
+  Flax 自写 PPO，checkpoint 双存（Flax + 部署用 .npz）。
+- 冻结内容详见上方决策 5（61 维布局/指令课程/跟踪奖励/脚本化评估）与
+  决策 6（MJX 移植要点/阶段 0~6/手柄安全/contact 掩码待办）。
+- **下一步（待用户发话）**：阶段 0/1 —— 4090 服务器环境 + dog_mjx.xml
+  适配 + `mjx.test_model()` 报告 + MJX/CPU 零策略动力学一致性校验。
+
+### 2026-09-26（晚）— MJX 阶段 1 完成：模型适配 + 一致性校验双关通过
+
+- 本地 venv 装好 CPU 版 jax/jaxlib 0.11.2 + mujoco-mjx 3.13.0（与 mujoco
+  3.13.0 精确配对）+ flax 0.12.9；阿里云镜像可用，TRAE 沙箱需外放 pip。
+- 产出：`envs/dog_mjx.xml`、`envs/scene_mjx.xml`、
+  `scripts/test_mjx_compat.py`（put_model/make_data/jit 三关）、
+  `scripts/verify_mjx_consistency.py`（A/B/C 三组轨迹对比+出图）、
+  `scripts/probe_mjx_options.py`、`scripts/probe_mjx_geometry.py`（实测探针，
+  推翻"必须金字塔锥/condim=3"的预判）。
+- 最终适配仅 3 处实质改动：积分器 implicitfast、cylinder→capsule（唯一硬限制，
+  `CYLINDER-BOX collisions not implemented`）、删 sensor 段；椭圆锥
+  impratio=100 与 condim=6 均保留。
+- 校验结果：纯引擎差 0.187°/0.38mm，模型适配差 0.36°/0.21mm，站立高度三方
+  重合（图 logs/mjx_consistency.png）。
+- **下一步**：阶段 0 收尾——同步到 4090 服务器装 CUDA 版 jax，跑 1024/2048
+  env 的 mjx.step 吞吐冒烟（拿到真实 step/s 再定 env 数与 rollout 尺寸）；
+  之后进入阶段 2 写 `envs/dog_env_mjx.py`（61 维观测/DR/指令课程）。
+  遗留：动态步行一致性（摆腿时 capsule 自碰撞包膜差异）阶段 2 后复测。
