@@ -69,18 +69,24 @@ def pack_mit(p_des: float, v_des: float, kp: float, kd: float,
 
 
 def unpack_mit_reply(payload: bytes) -> Dict[str, float]:
-    """解码电机反馈帧（标准 MIT reply：p16 | v12 | t12）
+    """解码电机反馈帧（2026-09-25 实机核对版）
 
-    待实机首帧核对：DM 反馈帧与 Unitree MIT reply 同构，
-    若实测解码数值量级不对，以抓到的原始帧为准调整位布局。
+    达妙 MIT 反馈布局（比标准 Unitree reply 多第 1 字节 ID/ERR）：
+      D0 = ID低4位 | ERR高4位（回显 Master ID，如 0x12）
+      D1,D2 = 位置 16bit
+      D3 = 速度高8位，D4高4位 = 速度低4位
+      D4低4位 | D5 = 力矩 12bit
+      D6 = MOS 温度°C，D7 = 转子温度°C
     """
-    p_uint = (payload[0] << 8) | payload[1]
-    v_uint = (payload[2] << 4) | (payload[3] >> 4)
-    t_uint = ((payload[3] & 0x0F) << 8) | payload[4]
+    p_uint = (payload[1] << 8) | payload[2]
+    v_uint = (payload[3] << 4) | (payload[4] >> 4)
+    t_uint = ((payload[4] & 0x0F) << 8) | payload[5]
     return {
         "pos": uint_to_float(p_uint, P_MIN, P_MAX, 16),
         "vel": uint_to_float(v_uint, V_MIN, V_MAX, 12),
         "tau": uint_to_float(t_uint, T_MIN, T_MAX, 12),
+        "t_mos": payload[6],
+        "t_rotor": payload[7],
     }
 
 
@@ -91,6 +97,16 @@ class MotorBus:
         # vendor dmcan 包在 deploy/dmcan
         deploy_dir = Path(__file__).resolve().parent
         sys.path.insert(0, str(deploy_dir))
+        # NUC 是 Ubuntu 20.04：系统 libstdc++ 最高 GLIBCXX_3.4.28、libusb 只有 1.0.23，
+        # 而 vendor libdm_device.so 需要 GLIBCXX_3.4.32 和 libusb_init_context(1.0.27+)。
+        # 若 deploy/dlls 下放有新版 .so，先 RTLD_GLOBAL 预加载，
+        # 后续 dlopen(libdm_device.so) 会按 SONAME 复用它们（不污染系统库）。
+        dlls = deploy_dir / "dlls"
+        for name in ("libstdc++.so.6", "libusb-1.0.so.0"):
+            candidate = dlls / name
+            if candidate.exists():
+                import ctypes
+                ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
         from dmcan import DmCanContext  # noqa: E402
 
         self._context = DmCanContext()
@@ -124,6 +140,9 @@ class MotorBus:
                     self.device.enable_channel(ch, False)
                 except Exception:
                     pass
+            # 等 SDK 的 rx 线程把在途 USB 批量传输消化完，否则 close 时
+            # libusb 会打 "transfer_cancelled" 并在后台线程触发断言
+            time.sleep(0.3)
         finally:
             self.device.close()
             self._context.destroy()
@@ -166,7 +185,8 @@ class MotorBus:
         try:
             state = unpack_mit_reply(payload)
         except Exception:
-            state = {"raw": payload.hex()}
+            state = {}
+        state["raw"] = payload.hex()  # 始终保留原始字节，便于位布局核对
         with self._fb_lock:
             self._feedback[(h.channel, motor_id)] = (time.time(), state)
 

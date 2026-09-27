@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -115,9 +116,17 @@ def main() -> int:
         return 0
     finally:
         # 兜底：把扫描过的所有 ID 都失能一遍
-        bus.disable_all([(ch, mid) for ch in channels
-                         for mid in range(ID_MIN, ID_MAX + 1)])
-        bus.close()
+        try:
+            bus.disable_all([(ch, mid) for ch in channels
+                             for mid in range(ID_MIN, ID_MAX + 1)])
+            bus.close()
+        except Exception:
+            pass
+        # 一次性 CLI 工具：C SDK 的析构线程在关闭 USB 时可能触发断言崩溃。
+        # 扫描结果已确认正确，flush 后直接 os._exit(0) 跳过 Python/C 清理。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

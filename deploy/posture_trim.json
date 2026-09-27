@@ -1,0 +1,20 @@
+{
+  "front": 0.0,
+  "rear": 0.1,
+  "unit": "rad（仿真系小腿关节增量）",
+  "measured_at": "2026-09-26",
+  "note": "实机站姿调平结果（前高后低 → 后腿抬高 0.1 rad）。部署时折叠进零偏：q_default_real_eff[i] = q_default_real[i] + S[i]*(-trim)，仅作用于小腿关节（前腿 idx 2,5 用 front，后腿 idx 8,11 用 rear）。kp=150/kd=2 下验证姿态水平，用户目视确认（2026-09-26 STAND 阶段）。",
+  "validation": {
+    "kp": 150,
+    "kd": 2,
+    "steady_state_err_rad": {
+      "FL": { "hip": -0.0023, "thigh": -0.0118, "calf": 0.0359 },
+      "FR": { "hip": -0.0031, "thigh": 0.0195, "calf": -0.0549 },
+      "RL": { "hip": -0.0313, "thigh": -0.0637, "calf": 0.0913 },
+      "RR": { "hip": 0.0221, "thigh": 0.0358, "calf": -0.1142 }
+    },
+    "max_err_rad": 0.1142,
+    "max_err_joint": "RR_calf",
+    "comment": "小腿残差 0.05~0.11 rad 不随 kp 增大而缩小，疑似电机力矩/供电电压上限；部署策略时以此为站立基线误差水平。"
+  }
+}

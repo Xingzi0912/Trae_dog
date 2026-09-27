@@ -1,4 +1,8 @@
-﻿import ctypes
+"""DM CAN 设备操作封装（vendored dmcan 1.0.4，已打 Python 3.8 兼容补丁）"""
+# Python 3.8：collections.abc.Callable[...] 下标需 3.9+，注解延迟求值即可
+from __future__ import annotations
+
+import ctypes
 from collections.abc import Callable
 from ctypes import *
 from typing import Optional, Any
