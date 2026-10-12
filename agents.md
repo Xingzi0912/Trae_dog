@@ -299,6 +299,123 @@ implemented`（站立即触发自碰撞）；size/pos/quat 原样保留
 
 ---
 
+## 决策 7：师生架构（Teacher-Student）（2026-10-12 冻结）
+
+**动机**：仿真可获取的特权信息（精确线速度、接触状态、DR 参数等）在实机不可得。
+直接用特权信息训出的策略无法部署；纯用 61 维实机观测训练则收敛慢且不稳。
+
+**方案**：两阶段训练
+
+1. **教师网络**（99 维 = 61 标准 + 38 特权）由 PPO 训练，收敛后冻结
+2. **学生网络**（61 维，实机可获取）通过蒸馏拟合教师
+
+**特权信息 38 维布局**（`_get_privileged_obs`）：
+
+```
+[ 0: 3] 精确 base 线速度（机身系）= Rᵀ·qvel[0:3]
+[ 3: 6] 精确 base 角速度（机身系）= qvel[3:6]
+[ 6:18] 精确关节位置 = qpos[7:]
+[18:30] 精确关节速度 = qvel[6:]
+[30:34] contact[4]（几何法：foot_z < 0.05m 判支撑）
+[34]    地面摩擦系数
+[35]    机身质量乘子
+[36:38] base x/y 世界位置
+```
+
+**蒸馏损失**：`L = 1.0·MSE(μ_s, μ_t) + 0.5·MSE(V_s, V_t)`
+
+- 动作拟合为主（α=1.0），价值为辅（β=0.5）
+- 数据收集：教师在环境中跑 rollout，存 (obs_61, μ_t, V_t)
+- 学生训练：标准监督学习，n_epochs × n_minibatches
+
+**文件**：
+
+- `algos/networks_jax.py`：`ActorCritic(obs_dim, action_dim, hidden=512)`
+  教师 `obs_dim=99`，学生 `obs_dim=61`，结构完全相同
+- `algos/ppo_jax.py`：阶段 1 PPO 训教师
+- `algos/distill_jax.py`：阶段 2 蒸馏学生
+
+---
+
+## 决策 8：残余策略学习（Residual Policy Learning）（2026-10-12 冻结）
+
+**动机**：纯 PPO 从零学走路需 20M+ 步且步态不自然。先规定正弦 trot 基准步态，
+网络只学残差微调（遇到障碍/指令变化时的修正），收敛更快且步态基底可控。
+
+**方案**：
+
+```
+q_des = q_default + gait(phase, command) + action × residual_scale
+```
+
+- `gait()` = 正弦 trot（`envs/gait.py`），对角腿同步（FL+RR / FR+RL），相位差 π
+- 频率由 vx 决定（vx=0→2Hz，vx=1.5→4Hz）
+- 幅值由 vx/vy/yaw 调制
+- `residual_scale = 0.2`（网络动作 ∈ [-1,1]，实际影响 ±0.2 rad）
+- `use_residual=True` 开启；False 回退到旧模式 `q_des = q_default + action×0.25`
+
+**步态参数**（`envs/gait.py`）：
+
+- hip 幅值 0.10 rad（vy 驱动左右摆）
+- thigh 幅值 0.35 rad（vx 驱动前后摆，主要推进关节）
+- calf 幅值 0.35 rad（与 thigh 反相，屈膝）
+
+**实机部署**：基准步态 gait() 在 NUC 端 numpy 即可计算（正弦函数），
+residual 由学生网络 npz 推理，两者叠加后经 S 矩阵映射到实机关节角。
+
+---
+
+## 服务器训练运行说明（2026-10-12）
+
+### 环境准备（首次）
+
+```bash
+# tmux 内
+cd ~/Sxy_dog/dog_rl
+pip install -r requirements-jax.txt
+# 验证 GPU 可用
+python -c "import jax; print(jax.devices())"
+# 应显示 [CudaDevice(id=0)]
+```
+
+### 正式训练（20M 步）
+
+```bash
+tmux new -s dog_train
+cd ~/Sxy_dog/dog_rl
+bash scripts/train_server.sh
+# 或自定义参数
+bash scripts/train_server.sh --steps 20000000 --n_envs 2048
+```
+
+### 冒烟测试（1万步，验证管线）
+
+```bash
+python -u train_jax.py --steps 10000 --n_envs 16
+```
+
+### 关键环境变量
+
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.4`：公用 4090 限 40% 显存
+  （train_server.sh 已自动设置；train_jax.py 也有 default 0.4）
+
+### 输出文件
+
+- `checkpoints/dog_cmd_mjx_teacher.pkl`：教师 Flax checkpoint
+- `checkpoints/dog_cmd_mjx_student.pkl`：学生 Flax checkpoint
+- `checkpoints/dog_cmd_mjx_student.npz`：学生部署包（NUC numpy 推理）
+- `logs/dog_cmd_mjx_curve.png`：学习曲线
+- `logs/run_YYYYMMDD_HHMMSS.log`：训练日志（tee 双写）
+
+### JIT 编译说明
+
+- **首次 step/reset 编译**：CPU ~60s，GPU ~30s（JAX 0.11.2 + MJX 3.13）
+- **首次 ppo_grad 编译**：CPU ~30s，GPU ~10s
+- 编译完成后物理步极快（GPU 2048env ~1167 step/s 实测）
+- 编译期间无输出属正常，**不是卡死**
+
+---
+
 ## 待办清单（按执行顺序）
 
 ### Step 1：让模型站起来 ⭐ 拦路虎，先验证
@@ -592,3 +709,38 @@ clip/kl 是否回落、σ 是否健康分化。
   env 的 mjx.step 吞吐冒烟（拿到真实 step/s 再定 env 数与 rollout 尺寸）；
   之后进入阶段 2 写 `envs/dog_env_mjx.py`（61 维观测/DR/指令课程）。
   遗留：动态步行一致性（摆腿时 capsule 自碰撞包膜差异）阶段 2 后复测。
+
+### 2026-10-12 — 阶段 2 完成 + 阶段 3 算法层完成 + 服务器就绪
+
+- **阶段 2 完成**（`envs/dog_env_mjx.py` 四项验证全通过）：
+  关节误差 0.067°(<0.5°)、base_z 误差 0.15mm(<1cm)、g_b=[0,0,-1]
+  语义正确、指令重采样正常、DR 无 NaN。本地 CPU JAX JIT 编译约 18 分钟，
+  编译完成后物理步执行速度正常。
+- **阶段 3 算法层完成**（师生架构 + 残差 RL，决策 7/8）：
+  - `algos/networks_jax.py`：Flax ActorCritic，教师 99 维 / 学生 61 维，
+    hidden=512，log_std 全局可学习参数（初始 -0.5 → σ≈0.61）
+  - `algos/ppo_jax.py`：PPO 训教师，GAE + clip + KL 早停 + obs_rms
+  - `algos/distill_jax.py`：蒸馏学生，MSE(μ) + MSE(V)
+  - `envs/gait.py`：正弦 trot 基准步态（残余 RL 用）
+  - `train_jax.py`：两阶段训练入口，argparse CLI，GPU 检测，周期 checkpoint
+  - `scripts/train_server.sh`：4090 服务器一键运行脚本
+  - `requirements-jax.txt`：JAX + MJX + Flax 依赖清单
+- **关键 bug 修复**（导致本地 10k 步训练失败的根因）：
+  1. **log_prob 不一致**：rollout 阶段的 log_prob 缺常数项
+     `-0.5·action_dim·log(2π)`（≈-10.56），而 loss 阶段有。导致 ratio 恒含
+     e^{10.56} 偏置，KL 假信号 ~13.07（日志记录值），触发 KL 早停，策略
+     无法学习。修复：统一用 `gaussian_log_prob()` 函数。
+  2. **无 JIT 编译**：ppo_loss 的 value_and_grad 和 actor_forward 每次调用
+     都重新 trace，CPU 上每个 update 耗时数分钟。修复：`jax.jit` 编译
+     gradient 和 forward 函数，只编译一次。
+  3. **KL 早停除数**：旧版 `kl_sum / n_minibatches` 即使中途 break 也除以
+     全部 minibatch 数。修复：按实际完成的 `n_mb_done` 计平均。
+- **服务器就绪**：代码已适配 4090 GPU（XLA_PYTHON_CLIENT_MEM_FRACTION=0.4，
+  GPU 自动检测 n_envs=2048，tmux + tee 双写日志），待 SSH 恢复后直接
+  `bash scripts/train_server.sh` 启动 20M 步正式训练。
+- **本地冒烟结果**：环境 4 项验证 + 师生架构冒烟（网络前向/PPO 损失+梯度/
+  蒸馏损失）+ 步态测试 + 训练管线冒烟（save_npz/PPO 单步/蒸馏单步）全部通过。
+  但 10k 步完整训练因 JIT 编译耗时过长（CPU 上无实用价值）放弃本地验证，
+  改为服务器直接跑。
+- **下一步**：4090 服务器恢复后 `bash scripts/train_server.sh` 启动训练，
+  观察 reward 曲线、KL 是否回到健康区（<0.02）、σ 是否稳定。

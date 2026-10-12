@@ -1,0 +1,26 @@
+# JAX + MJX 训练依赖（4090 服务器，Linux x86_64，CUDA 12）
+#
+# 安装方法（tmux 内）：
+#   pip install -r requirements-jax.txt
+#
+# 注意：
+#   - mujoco-mjx 版本必须与 mujoco 精确一致（3.13.0）
+#   - jax[cuda12] 装 GPU 版，CPU 环境装 jax（不带 [cuda12]）
+#   - 阿里云镜像可用（清华镜像 mujoco-mjx 滞后）
+
+# JAX GPU 版（CUDA 12）
+jax[cuda12]==0.11.2
+jaxlib==0.11.2
+
+# MuJoCo + MJX（版本精确配对）
+mujoco==3.13.0
+mujoco-mjx==3.13.0
+
+# Flax（神经网络）
+flax==0.12.9
+
+# 优化器
+optax
+
+# 绘图
+matplotlib
