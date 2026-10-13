@@ -318,7 +318,11 @@ class DogEnvMJX:
         lo, hi = cfg.cmd_resample_steps
         state = EnvState(
             dx=dx,
-            last_action=jnp.zeros(12),
+            # 必须强类型（weak_type=False）：jnp.zeros 产出的是弱类型 float 数组，而
+            # 一次 env.step 之后 last_action 由网络输出算出、变成强类型，jit 缓存键
+            # （含 avals.weak_type）随之改变 → mega-jit 多编译一次（实测 128 env
+            # update 0/1 = 18.2s/17.3s，之后才落到 6.1s）
+            last_action=jnp.array(np.zeros(12, dtype=np.float32)),
             command=self._sample_command(k_cmd),
             delay_buf=jnp.repeat(self._q_default[None, :], 3, axis=0),
             delay=delay,

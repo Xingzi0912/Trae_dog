@@ -18,6 +18,11 @@ PPO 配方（沿用旧 PyTorch 版验证过的超参，决策 6）：
     2. JIT 编译：ppo_grad / actor_forward 全部 jit，避免每步重新 trace
     3. KL 早停除数修正：按实际完成的 minibatch 数计平均
 
+
+
+
+
+    
 关键修复（2026-10-13，mega-jit 重构）：
     旧版"scan rollout + Python 端 epoch/minibatch 循环"在 4090 服务器上
     每个 update 触发一次完整重编译（dt≈19~26 分钟，remat 警告字节数逐字节
@@ -180,11 +185,29 @@ def compute_gae(rewards, values, dones, last_value,
     return advantages, returns
 
 
+def _to_strong(x):
+    """float 叶子统一转强类型（weak_type=False）float32。
+
+    jnp.zeros/ones/full 以及 Flax/optax 的初始化器都可能产出 weak_type=True 的
+    数组；只要第一次 optimizer update 把它们变成强类型，jit 的缓存键（含
+    avals.weak_type）就变了 → 整个 mega-jit 再编译一次（实测 128 env 下
+    update 0/1 各 18.2s/17.3s，之后才落到 6.1s）。把初始 params/opt_state 强类型
+    化后，jit_update 全程只编译一次。非 float 叶子（如 adam 的 int32 count）原样保留。
+    """
+    if jnp.issubdtype(x.dtype, jnp.floating):
+        return jnp.asarray(np.asarray(x, dtype=np.float32))
+    return x
+
+
 def create_train_state(rng, tx):
     model = make_teacher()
-    dummy = jnp.zeros((1, 99))
+    # dummy 也要强类型：jnp.zeros 是弱类型，而 Flax 以输入 dtype 决定参数 dtype
+    dummy = jnp.array(np.zeros((1, 99), dtype=np.float32))
     params = model.init(rng, dummy)
-    return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    ts = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    return ts.replace(
+        params=jax.tree_util.tree_map(_to_strong, ts.params),
+        opt_state=jax.tree_util.tree_map(_to_strong, ts.opt_state))
 
 
 def make_update(env, config: PPOConfig, tx):
