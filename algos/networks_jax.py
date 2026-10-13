@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import flax.linen as nn
 
 
@@ -40,8 +41,16 @@ class ActorCritic(nn.Module):
         mu = nn.Dense(self.action_dim)(a)
 
         # 全局 log_std（状态无关）
+        # 必须用**强类型**常量初始化：jnp.full / jnp.zeros / jnp.ones 产出的是弱类型
+        # 数组（weak_type=True），而第一次 optimizer update 之后它变成强类型。jit 的
+        # 缓存键含 avals（含 weak_type），于是第二个 update 会重编译一次（实测 64 env
+        # 下 update 0/1 各 17.3s/16.5s，之后才降到 5s）。用 numpy float32 → jnp.array
+        # 得到 weak_type=False 的常量，params（及其 opt_state 的 mu/nu）从第一帧起就
+        # 稳定，jit_update 只编译一次。
         log_std = self.param(
-            "log_std", lambda rng, shape: jnp.full(shape, self.init_log_std),
+            "log_std",
+            lambda rng, shape: jnp.array(
+                np.full(shape, self.init_log_std, dtype=np.float32)),
             (self.action_dim,))
         std = jnp.exp(log_std)
 
