@@ -223,6 +223,28 @@ def train(rng, env, config: PPOConfig,
     metrics = {"update": [], "reward": [], "entropy": [], "kl": [],
                "value_loss": [], "policy_loss": []}
 
+    # --- obs_rms warmup（避免第一次 rollout 用 mean=0/var=1 等于没归一化）---
+    # teacher_obs 含 IMU(~10) / 关节角(~1) / 特权信息，尺度差异大；
+    # 若不 warmup，第一次梯度更新会让网络输出剧变 → 第二次 rollout KL 偏高
+    log_fn("  obs_rms warmup...")
+    for _ in range(config.rollout_len):
+        teacher_obs_norm = obs_rms.normalize(teacher_obs)
+        mu, std, _ = actor_forward(ts.params, teacher_obs_norm)
+        rng, act_rng = jax.random.split(rng)
+        action = mu + std * jax.random.normal(act_rng, mu.shape)
+        action = jnp.clip(action, -1.0, 1.0)
+        state, obs, _, _, _, info = env.step(state, action)
+        priv = info["privileged_obs"]
+        teacher_obs = make_teacher_obs(obs, priv)
+        obs_rms = obs_rms.update(teacher_obs)
+    # warmup 后 reset，避免初始 transient 状态污染第一个真实 rollout
+    rng, reset_rng = jax.random.split(rng)
+    state, obs = env.reset(reset_rng)
+    priv = env.get_privileged_obs(state)
+    teacher_obs = make_teacher_obs(obs, priv)
+    log_fn(f"  obs_rms warmup done: mean|obs|={float(jnp.abs(obs_rms.mean).mean()):.3f}, "
+           f"mean|var|={float(obs_rms.var.mean()):.3f}")
+
     for update in range(n_updates):
         t0 = time.time()
         rollout_obs, rollout_act, rollout_lp, rollout_val = [], [], [], []
@@ -233,9 +255,12 @@ def train(rng, env, config: PPOConfig,
             teacher_obs_norm = obs_rms.normalize(teacher_obs)
             mu, std, value = actor_forward(ts.params, teacher_obs_norm)
             rng, act_rng = jax.random.split(rng)
-            action = mu + std * jax.random.normal(act_rng, mu.shape)
+            action_raw = mu + std * jax.random.normal(act_rng, mu.shape)
+            action = jnp.clip(action_raw, -1.0, 1.0)
+            # 关键：用 clip 后的 action 算 log_prob（与 ppo_loss 的 batch["action"] 一致）
+            # 否则被 clip 的维度 old_log_prob 用 clip 前的 action（距 mu 远，log_prob 很负），
+            # new_log_prob 用 clip 后的 action（距 mu 近），ratio=exp(正大数)→ KL 爆炸
             log_prob = gaussian_log_prob(action, mu, std)
-            action = jnp.clip(action, -1.0, 1.0)
 
             state, obs, reward, term, trunc, info = env.step(state, action)
             done = jnp.logical_or(term, trunc)
