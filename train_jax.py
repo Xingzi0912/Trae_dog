@@ -34,7 +34,7 @@ import numpy as np
 
 # 必须在 import jax 之后、创建任何数组之前设置
 # 公用 4090 服务器限 40% 显存（避免影响他人训练任务）
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.4")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
 
 from envs.dog_env_mjx import DogEnvMJX, EnvConfig
 from algos.ppo_jax import PPOConfig, train as train_teacher

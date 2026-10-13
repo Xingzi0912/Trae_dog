@@ -17,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # GPU 显存限制（公用 4090，避免影响他人训练）
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.4
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 
 # 默认参数
 STEPS=${STEPS:-20000000}
