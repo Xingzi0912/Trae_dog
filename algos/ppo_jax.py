@@ -17,6 +17,15 @@ PPO 配方（沿用旧 PyTorch 版验证过的超参，决策 6）：
        旧版 rollout 缺 -0.5*action_dim*log(2π)，导致 KL 常年 ~10.5 假早停
     2. JIT 编译：ppo_grad / actor_forward 全部 jit，避免每步重新 trace
     3. KL 早停除数修正：按实际完成的 minibatch 数计平均
+
+关键修复（2026-10-13，mega-jit 重构）：
+    旧版"scan rollout + Python 端 epoch/minibatch 循环"在 4090 服务器上
+    每个 update 触发一次完整重编译（dt≈19~26 分钟，remat 警告字节数逐字节
+    相同），且每 minibatch float(kl) 造成 host-device 同步。现把
+    rollout + GAE + n_epochs×n_minibatches 包进单个 jit（Brax 风格），
+    整个训练只编译一次；KL 早停改为 epoch mask（超阈值后 lr 置零，参数
+    冻结，语义与 Python break 等价）；LR 线性衰减正式接线（旧版
+    anneal_steps 传了但从未生效）。
 """
 
 from __future__ import annotations
@@ -178,61 +187,134 @@ def create_train_state(rng, tx):
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
-def make_scan_rollout(env, config: PPOConfig):
-    """构造 JIT'd scan rollout（消除 Python 循环的 host-device 同步）
+def make_update(env, config: PPOConfig, tx):
+    """构造单次 JIT 编译的完整 PPO update（Brax 风格 mega-jit）
 
-    性能修复（2026-10-13）：Python 循环 rollout 每步 4+ 次 JIT'd 调用打断
-    JAX 异步执行触发同步 + 每步调 env.reset(2048 envs)，dt=1149s/update。
-    scan 化后 24 步在 GPU 上一次循环完成，无 Python 同步，预期 dt 降到几秒
-    （MJX 官方示例 / Walk in the Park 的标准做法）。
+    rollout + GAE + n_epochs×n_minibatches 全部在一次 jit 内完成：
+    - 整个训练只编译一次，杜绝 per-update 重编译（2026-10-13 实测旧结构
+      每个 update 重编译 scan_rollout，dt≈19~26 分钟）
+    - 消除 Python 循环的全部 host-device 同步（旧版每 minibatch
+      float(kl) 同步一次，32 次/update）
+    - KL 早停 = epoch mask：某 epoch 平均 KL 超 target_kl 后，后续 epoch
+      lr 置零、参数冻结（该 epoch 本身完整应用，与旧版 Python break 等价）
 
-    carry: (state, teacher_obs, rng, params, obs_mean, obs_var)
-    输出: (obs_norm, action, log_prob, value, reward, done, obs_raw)
+    jit_update 参数（签名跨 update 完全稳定，不会重编译）：
+        state, teacher_obs, rng, params, opt_state,
+        obs_mean, obs_var, obs_count, lr_t
+    返回：(state, teacher_obs, rng, params, opt_state,
+           obs_mean, obs_var, obs_count) 8 元 carry, metrics
+        metrics: reward 标量；kl/entropy/value_loss/policy_loss/active
+                 为 (n_epochs,) 逐 epoch 数组。active[e]=1 表示 epoch e
+                 实际参与了更新（0 = 已被 KL mask 冻结）。
     """
     model = make_teacher()
+    ppo_loss = make_ppo_loss(config.clip_eps, config.entropy_coef,
+                             config.value_coef)
+    grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
     rollout_len = config.rollout_len
-
-    def scan_step(carry, _):
-        state, teacher_obs, rng, params, obs_mean, obs_var = carry
-
-        # normalize（obs_rms 在 rollout 期间固定，rollout 结束后才更新）
-        teacher_obs_norm = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-
-        # policy forward
-        mu, std, value = model.apply(params, teacher_obs_norm)
-
-        # sample action（先 clip 再算 log_prob，与 ppo_loss 一致）
-        rng, act_rng, reset_rng = jax.random.split(rng, 3)
-        action = mu + std * jax.random.normal(act_rng, mu.shape)
-        action = jnp.clip(action, -1.0, 1.0)
-        log_prob = gaussian_log_prob(action, mu, std)
-
-        # env step
-        state, obs, reward, term, trunc, info = env.step(state, action)
-        done = jnp.logical_or(term, trunc)
-        priv = info["privileged_obs"]
-        teacher_obs_new = make_teacher_obs(obs, priv)
-
-        # auto-reset：每步对 done 的 env 用 fresh state 替换
-        # （fresh_state 每步重新采样，不同 env 用不同 reset_rng → 不同初态）
-        fresh_state, fresh_obs = env.reset(reset_rng)
-        fresh_priv = env.get_privileged_obs(fresh_state)
-        fresh_teacher_obs = make_teacher_obs(fresh_obs, fresh_priv)
-        state = tree_where_done(done, fresh_state, state)
-        teacher_obs_out = tree_where_done(done, fresh_teacher_obs,
-                                          teacher_obs_new)
-
-        new_carry = (state, teacher_obs_out, rng, params,
-                     obs_mean, obs_var)
-        output = (teacher_obs_norm, action, log_prob, value, reward,
-                  done, teacher_obs_new)
-        return new_carry, output
+    batch_size = config.n_envs * config.rollout_len
+    n_mb = config.n_minibatches
+    mb_size = batch_size // n_mb
+    target_kl = config.target_kl
 
     @jax.jit
-    def scan_rollout(carry):
-        return jax.lax.scan(scan_step, carry, None, length=rollout_len)
+    def jit_update(state, teacher_obs, rng, params, opt_state,
+                   obs_mean, obs_var, obs_count, lr_t):
+        # ---------- 1. rollout（obs_rms 本批内固定）----------
+        def scan_step(carry, _):
+            st, tobs, k = carry
+            # normalize（rollout 期间固定，结束后才更新）
+            tobs_n = (tobs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+            mu, std, value = model.apply(params, tobs_n)
+            # 先 clip 再算 log_prob（与 ppo_loss 一致）
+            k, k_act, k_reset = jax.random.split(k, 3)
+            action = mu + std * jax.random.normal(k_act, mu.shape)
+            action = jnp.clip(action, -1.0, 1.0)
+            log_prob = gaussian_log_prob(action, mu, std)
+            # env step + auto-reset
+            st, obs, rew, term, trunc, info = env.step(st, action)
+            done = jnp.logical_or(term, trunc)
+            tobs_new = make_teacher_obs(obs, info["privileged_obs"])
+            fresh_st, fresh_obs = env.reset(k_reset)
+            fresh_tobs = make_teacher_obs(fresh_obs,
+                                          env.get_privileged_obs(fresh_st))
+            st = tree_where_done(done, fresh_st, st)
+            tobs_out = tree_where_done(done, fresh_tobs, tobs_new)
+            out = (tobs_n, action, log_prob, value, rew, done, tobs_new)
+            return (st, tobs_out, k), out
 
-    return scan_rollout
+        (state, teacher_obs, rng), ro = jax.lax.scan(
+            scan_step, (state, teacher_obs, rng), None, length=rollout_len)
+        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr = ro
+
+        # ---------- 2. GAE ----------
+        tobs_last_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+        _, _, last_value = model.apply(params, tobs_last_n)
+        adv, ret = compute_gae(rew_arr, val_arr, done_arr, last_value,
+                               config.gamma, config.gae_lambda)
+
+        # ---------- 3. obs_rms 更新（本批原始观测，供下一 update 用）----------
+        flat = raw_arr.reshape(-1, raw_arr.shape[-1])
+        b_mean = jnp.mean(flat, axis=0)
+        b_var = jnp.var(flat, axis=0)
+        b_cnt = flat.shape[0]
+        delta = b_mean - obs_mean
+        obs_count = obs_count + b_cnt
+        m2 = (obs_var * (obs_count - b_cnt) + b_var * b_cnt
+              + delta ** 2 * (obs_count - b_cnt) * b_cnt / obs_count)
+        obs_mean = obs_mean + delta * b_cnt / obs_count
+        obs_var = m2 / obs_count
+
+        # ---------- 4. PPO epochs（scan + KL mask）----------
+        batch = {
+            "obs": obs_arr.reshape(batch_size, -1),
+            "action": act_arr.reshape(batch_size, -1),
+            "old_log_prob": lp_arr.reshape(batch_size),
+            "advantage": adv.reshape(batch_size),
+            "return_val": ret.reshape(batch_size),
+            "old_value": val_arr.reshape(batch_size),
+        }
+        a = batch["advantage"]
+        batch["advantage"] = (a - a.mean()) / (a.std() + 1e-8)
+
+        def epoch_fn(carry, epoch_rng):
+            params, opt_state, active = carry
+            a_in = active
+            lr_eff = lr_t * active   # KL mask：active=0 时本 epoch 参数冻结
+            perm = jax.random.permutation(epoch_rng, batch_size)
+            mbs = jax.tree_util.tree_map(
+                lambda x: x[perm].reshape(n_mb, mb_size, *x.shape[1:]),
+                batch)
+
+            def mb_fn(c, mb):
+                p, os_ = c
+                (_, info), grads = grad_fn(p, mb)
+                upd, os_ = tx.update(grads, os_, p)
+                # tx 内 adam lr=1.0，在此按 lr_t 缩放（支持 lr 衰减+KL mask）
+                upd = jax.tree_util.tree_map(lambda u: u * lr_eff, upd)
+                p = optax.apply_updates(p, upd)
+                return (p, os_), info
+
+            (params, opt_state), infos = jax.lax.scan(
+                mb_fn, (params, opt_state), mbs)
+            kl_e = infos["kl"].mean()
+            active = active * (kl_e <= target_kl).astype(jnp.float32)
+            m_out = {"kl": kl_e, "entropy": infos["entropy"].mean(),
+                     "value_loss": infos["value_loss"].mean(),
+                     "policy_loss": infos["policy_loss"].mean(),
+                     "active": a_in}
+            return (params, opt_state, active), m_out
+
+        rng, k_epoch = jax.random.split(rng)
+        epoch_rngs = jax.random.split(k_epoch, config.n_epochs)
+        (params, opt_state, _), m_ep = jax.lax.scan(
+            epoch_fn, (params, opt_state, jnp.float32(1.0)), epoch_rngs)
+
+        metrics = {"reward": rew_arr.mean(), **m_ep}
+        return (state, teacher_obs, rng, params, opt_state,
+                obs_mean, obs_var, obs_count), metrics
+
+    return jit_update
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +323,11 @@ def make_scan_rollout(env, config: PPOConfig):
 def train(rng, env, config: PPOConfig,
           log_fn: Callable[[str], None] = print,
           save_fn: Callable | None = None):
-    """PPO 训练主循环
+    """PPO 训练主循环（mega-jit 版）
+
+    单 update = 一次 jit_update 调用（rollout+GAE+epochs 全在 GPU 完成）。
+    LR 线性衰减：lr_t = lr × (1 − steps_done/anneal_steps)，按 update 递减。
+    （旧版 anneal_steps 传了但从未接线，2026-10-13 修复。）
 
     Args:
         rng: JAX 随机键
@@ -251,18 +337,16 @@ def train(rng, env, config: PPOConfig,
         save_fn: 可选 checkpoint 回调 (ts, obs_rms, update) -> None
     返回: (ts, obs_rms, metrics)
     """
+    # adam 用 lr=1.0，真实 lr 在 jit_update 内由 lr_t 缩放（数学上等价，
+    # 同时支持 lr 衰减与 KL epoch mask）
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
-        optax.adam(config.lr),
+        optax.adam(1.0),
     )
     rng, init_rng = jax.random.split(rng)
     ts = create_train_state(init_rng, tx)
     obs_rms = RunningMeanStd.create((99,))
 
-    # JIT'd 核心函数（只编译一次，后续 update 复用）
-    ppo_loss = make_ppo_loss(config.clip_eps, config.entropy_coef,
-                             config.value_coef)
-    ppo_grad = jax.jit(jax.value_and_grad(ppo_loss, has_aux=True))
     actor_forward = jax.jit(
         lambda params, obs: make_teacher().apply(params, obs))
 
@@ -302,80 +386,51 @@ def train(rng, env, config: PPOConfig,
     log_fn(f"  obs_rms warmup done: mean|obs|={float(jnp.abs(obs_rms.mean).mean()):.3f}, "
            f"mean|var|={float(obs_rms.var.mean()):.3f}")
 
-    # scan 化 rollout（JIT 编译一次，消除 Python 循环的 host-device 同步）
-    scan_rollout = make_scan_rollout(env, config)
-    log_fn("  scan_rollout JIT 编译中（首次会较慢）...")
+    # mega-jit：rollout+GAE+epochs 单次编译，整个训练只编译一次
+    jit_update = make_update(env, config, tx)
+    log_fn("  jit_update 编译中（一次性，会较慢）...")
 
+    params, opt_state = ts.params, ts.opt_state
     for update in range(n_updates):
         t0 = time.time()
 
-        # --- scan 化 rollout（24 步在 GPU 上一次循环，无 Python 同步）---
-        carry = (state, teacher_obs, rng, ts.params,
-                 obs_rms.mean, obs_rms.var)
-        carry, rollout_out = scan_rollout(carry)
-        state, teacher_obs, rng, _, _, _ = carry
-        # rollout_out: (obs_norm, action, log_prob, value, reward, done, obs_raw)
-        # 每个 shape (T, N, ...)
-        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, obs_raw_arr = \
-            rollout_out
+        lr_t = jnp.float32(
+            config.lr * max(0.0, 1.0 - update * batch_size
+                            / config.anneal_steps))
+        carry_out, m = jit_update(
+            state, teacher_obs, rng, params, opt_state,
+            obs_rms.mean, obs_rms.var, obs_rms.count, lr_t)
+        (state, teacher_obs, rng, params, opt_state,
+         o_mean, o_var, o_count) = carry_out
+        obs_rms = RunningMeanStd(mean=o_mean, var=o_var, count=o_count)
+        ts = ts.replace(params=params, opt_state=opt_state)
+        m = jax.device_get(m)   # 每 update 仅这一次 host 同步
 
-        # --- GAE ---
-        _, _, last_value = actor_forward(ts.params,
-                                         obs_rms.normalize(teacher_obs))
-        advantages, returns = compute_gae(
-            rew_arr, val_arr, done_arr, last_value,
-            config.gamma, config.gae_lambda)
-
-        obs_rms = obs_rms.update(obs_raw_arr)
-
-        # --- PPO update ---
-        batch = {
-            "obs": obs_arr.reshape(batch_size, -1),
-            "action": act_arr.reshape(batch_size, -1),
-            "old_log_prob": lp_arr.reshape(batch_size),
-            "advantage": advantages.reshape(batch_size),
-            "return_val": returns.reshape(batch_size),
-            "old_value": val_arr.reshape(batch_size),
-        }
-        batch["advantage"] = (batch["advantage"] - batch["advantage"].mean()) \
-                             / (batch["advantage"].std() + 1e-8)
-
-        last_info = None
-        for epoch in range(config.n_epochs):
-            rng, perm_rng = jax.random.split(rng)
-            perm = jax.random.permutation(perm_rng, batch_size)
-            mb_size = batch_size // config.n_minibatches
-            kl_sum = 0.0
-            n_mb_done = 0
-            for i in range(config.n_minibatches):
-                mb_idx = perm[i * mb_size:(i + 1) * mb_size]
-                mb = jax.tree_util.tree_map(lambda x: x[mb_idx], batch)
-                (loss, info_grad), grads = ppo_grad(ts.params, mb)
-                ts = ts.apply_gradients(grads=grads)
-                kl_sum += float(info_grad["kl"])
-                last_info = info_grad
-                n_mb_done += 1
-            avg_kl = kl_sum / n_mb_done
-            if avg_kl > config.target_kl:
-                log_fn(f"    KL 早停 @epoch {epoch}, kl={avg_kl:.4f}")
-                break
-
-        # --- metrics ---
         dt = time.time() - t0
         sps = batch_size / dt if dt > 0 else 0
+
+        # 逐 epoch 指标：取最后一个活跃 epoch（被 mask 冻结的 epoch 参数
+        # 不变，其 kl 恒等于冻结点值；活跃序列末尾即触发早停的那个 epoch）
+        n_active = max(1, int(m["active"].sum()))
+        kl = float(m["kl"][n_active - 1])
+        ent = float(m["entropy"][n_active - 1])
+        vloss = float(m["value_loss"][n_active - 1])
+        ploss = float(m["policy_loss"][n_active - 1])
+        if n_active < config.n_epochs:
+            log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
+
         metrics["update"].append(update)
-        metrics["reward"].append(float(rew_arr.mean()))
-        metrics["entropy"].append(float(last_info["entropy"]))
-        metrics["kl"].append(avg_kl)
-        metrics["value_loss"].append(float(last_info["value_loss"]))
-        metrics["policy_loss"].append(float(last_info["policy_loss"]))
+        metrics["reward"].append(float(m["reward"]))
+        metrics["entropy"].append(ent)
+        metrics["kl"].append(kl)
+        metrics["value_loss"].append(vloss)
+        metrics["policy_loss"].append(ploss)
 
         if update % config.log_interval == 0:
             log_fn(f"  update {update}/{n_updates}, "
-                   f"reward={float(rew_arr.mean()):.3f}, "
-                   f"entropy={float(last_info['entropy']):.3f}, "
-                   f"kl={avg_kl:.4f}, "
-                   f"dt={dt:.1f}s, sps={sps:.0f}")
+                   f"reward={float(m['reward']):.3f}, "
+                   f"entropy={ent:.3f}, kl={kl:.4f}, "
+                   f"lr={float(lr_t):.2e}, dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
             save_fn(ts, obs_rms, update)
