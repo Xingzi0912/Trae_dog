@@ -18,9 +18,16 @@
      （100~200 策略步）重采样，17% 概率零指令（决策 5.2）。课程收缩由训练脚本
      通过 EnvConfig 的 cmd_* 范围参数实现，环境本身始终按给定范围采样
   5. 奖励改速度跟踪高斯（决策 5.3），v1 不加步态相位/腾空奖励
-  6. DR 全向量化：模型级（摩擦/质量/kp/kv）经 vmap 内 mjx.Model.replace
-     注入 per-env 参数（模型本体共享一份，不把 mesh 等大字段按 env 复制）；
-     初态扰动/动作延迟(0~2 策略步)/观测噪声在 reset/step 内逐 env 采样
+  6. DR 分两层（2026-10-13 重构，纯性能原因）：
+     a) 模型级（摩擦/质量/kp/kv）在 vmap **外层**注入：每次 rollout 由训练脚本
+        采样一份**标量** DR（sample_model_dr），env.build_model(dr) 得到
+        **非批化**的单个 mjx.Model，再以 in_axes=None 广播给整批 env。
+        实测（probe_batch，N=2048）：模型一旦按 env 批化——无论全批化 (0,0)
+        还是旧版「vmap 内 replace」的混批——mjx.step 快路径立即失效，吞吐从
+        21,000 掉到 ~660 env·物理子步/s（31 倍）；共享非批化模型则 20,963。
+        代价：同一 rollout 内整批 env 共享同一份模型级 DR（分布仍跨 update 覆盖）。
+     b) 便宜的 per-env DR 全部保留：初态扰动/动作延迟(0~2 策略步)/观测噪声/
+        指令采样都在 Data/state 里逐 env 采样，与模型无关
 
 观测布局（61 维，除 base_z 外全部机身系）：
     [ 0]    base_z（世界系高度）= qpos[2]
@@ -234,19 +241,61 @@ class DogEnvMJX:
             np.zeros(3),                       # 58:61 指令（自身已知量）
         ]).astype(np.float32))
 
-        self._reset_batch = jax.jit(jax.vmap(self._reset_one))
+        self._reset_batch = jax.jit(jax.vmap(self._reset_one, in_axes=(0, None)))
         self._step_batch = jax.jit(jax.vmap(self._step_one, in_axes=(None, 0, 0)))
+        # 当前 rollout 的模型级 DR（脚本/单测走这两个默认值；训练脚本每 update
+        # 显式 resample/传参，避免闭包常量随 update 变化触发 mega-jit 重编译）
+        self.resample_dr(jax.random.PRNGKey(0))
+
+    # --------------------------------------------------------------
+    # 模型级 DR（vmap 外层，标量）——见文件头「关键差异 6」
+    # --------------------------------------------------------------
+    def sample_model_dr(self, key: jax.Array) -> DRParams:
+        """采样一份**标量**模型级 DR（整批 env 共享，整 rollout 恒定）"""
+        cfg = self.cfg
+        if not cfg.dr_enabled:
+            return DRParams(fric=self._nom_floor_fric, mass_scale=jnp.float32(1.0),
+                            kp_scale=jnp.float32(1.0), kv_scale=jnp.float32(1.0))
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        return DRParams(
+            fric=jax.random.uniform(k1, (), minval=cfg.friction_range[0],
+                                    maxval=cfg.friction_range[1]),
+            mass_scale=jax.random.uniform(k2, (), minval=cfg.base_mass_range[0],
+                                          maxval=cfg.base_mass_range[1]),
+            kp_scale=jax.random.uniform(k3, (), minval=cfg.kp_scale_range[0],
+                                        maxval=cfg.kp_scale_range[1]),
+            kv_scale=jax.random.uniform(k4, (), minval=cfg.kv_scale_range[0],
+                                        maxval=cfg.kv_scale_range[1]),
+        )
+
+    def build_model(self, dr_model: DRParams) -> mjx.Model:
+        """把标量 DR 注入共享模型 → **非批化**单模型（必须 in_axes=None 广播）"""
+        if not self.cfg.dr_enabled:
+            return self._mx
+        return self._apply_dr(self._mx, dr_model)
+
+    def resample_dr(self, key: jax.Array) -> DRParams:
+        """重采样本 rollout 的模型级 DR（脚本/单测便捷入口，会改 env 属性）"""
+        self._dr_model = self.sample_model_dr(key)
+        self._mx_eff = self.build_model(self._dr_model)
+        return self._dr_model
 
     # --------------------------------------------------------------
     # 对外 API（rng 单 key 传入，内部分拆到 n_envs）
     # --------------------------------------------------------------
-    def reset(self, rng: jax.Array):
-        """→ (state, obs)，叶子形状 (n_envs, ...)"""
-        return self._reset_batch(jax.random.split(rng, self.n_envs))
+    def reset(self, rng: jax.Array, dr_model: DRParams = None):
+        """→ (state, obs)，叶子形状 (n_envs, ...)；dr_model 缺省用 self._dr_model"""
+        dr_model = self._dr_model if dr_model is None else dr_model
+        return self._reset_batch(jax.random.split(rng, self.n_envs), dr_model)
 
-    def step(self, state: EnvState, action: jax.Array):
-        """action (n_envs,12) → (state, obs, reward, terminated, truncated, info)"""
-        return self._step_batch(self._mx, state, action)
+    def step(self, state: EnvState, action: jax.Array, mx_model: mjx.Model = None):
+        """action (n_envs,12) → (state, obs, reward, terminated, truncated, info)
+
+        mx_model 缺省用 self._mx_eff；训练时由 mega-jit 内的上层传入（见
+        ppo_jax.make_update），保证模型是「非批化 + 显式参数」而非闭包常量。
+        """
+        mx_model = self._mx_eff if mx_model is None else mx_model
+        return self._step_batch(mx_model, state, action)
 
     def get_privileged_obs(self, state):
         """批量获取特权信息 (n_envs, 38)，供教师网络使用"""
@@ -266,28 +315,16 @@ class DogEnvMJX:
         zero = jax.random.bernoulli(k4, cfg.zero_cmd_prob)
         return jnp.where(zero, jnp.zeros(3), cmd)
 
-    def _reset_one(self, key):
+    def _reset_one(self, key, dr: DRParams):
         cfg = self.cfg
-        k_dr, k_init, k_cmd, k_delay, k_int, k_noise = jax.random.split(key, 6)
+        k_init, k_cmd, k_delay, k_int, k_noise = jax.random.split(key, 5)
 
-        # 模型级 DR 参数（关闭时取标称，且 _apply_dr 不会被调用）
+        # 模型级 DR 由调用方在 vmap 外层采样后广播进来（build_model 用它注入共享
+        # 模型）；state.dr 只保留这份标量供特权观测使用，不再参与模型构造
         if cfg.dr_enabled:
-            k1, k2, k3, k4 = jax.random.split(k_dr, 4)
-            dr = DRParams(
-                fric=jax.random.uniform(k1, (), minval=cfg.friction_range[0],
-                                        maxval=cfg.friction_range[1]),
-                mass_scale=jax.random.uniform(k2, (), minval=cfg.base_mass_range[0],
-                                              maxval=cfg.base_mass_range[1]),
-                kp_scale=jax.random.uniform(k3, (), minval=cfg.kp_scale_range[0],
-                                            maxval=cfg.kp_scale_range[1]),
-                kv_scale=jax.random.uniform(k4, (), minval=cfg.kv_scale_range[0],
-                                            maxval=cfg.kv_scale_range[1]),
-            )
             delay = jax.random.randint(k_delay, (), cfg.action_delay_range[0],
                                        cfg.action_delay_range[1] + 1)
         else:
-            dr = DRParams(fric=self._nom_floor_fric, mass_scale=jnp.float32(1.0),
-                          kp_scale=jnp.float32(1.0), kv_scale=jnp.float32(1.0))
             delay = jnp.zeros((), jnp.int32)
 
         # 初态扰动（在 keyframe home 基准上叠加）
@@ -335,7 +372,11 @@ class DogEnvMJX:
         return state, obs
 
     def _apply_dr(self, mx: mjx.Model, dr: DRParams) -> mjx.Model:
-        """把 per-env 模型级 DR 参数注入共享模型（vmap 内调用，模型本体不复制）"""
+        """把**标量**模型级 DR 注入共享模型（只在 vmap 外层调用，见 build_model）
+
+        必须在 vmap 外调用：一旦在 vmap 内按 lane 构造模型（旧实现），XLA 会把
+        模型当成逐 env 变化的量，mjx.step 快路径失效（实测慢 31 倍，见文件头）。
+        """
         gf = mx.geom_friction.at[self._floor_id, 0].set(dr.fric)
         bm = mx.body_mass.at[self._base_id].set(self._nom_base_mass * dr.mass_scale)
         ag = mx.actuator_gainprm.at[:, 0].set(self._nom_gain0 * dr.kp_scale)
@@ -406,8 +447,7 @@ class DogEnvMJX:
 
     def _step_one(self, mx: mjx.Model, state: EnvState, action: jax.Array):
         cfg = self.cfg
-        if cfg.dr_enabled:
-            mx = self._apply_dr(mx, state.dr)
+        # mx 由 vmap 外层构建好（build_model），此处不做任何 per-lane 模型改动
 
         # 动作 → q_des → 延迟队列（delay 步后生效，0 步即即时）
         action = jnp.clip(action, -1.0, 1.0)

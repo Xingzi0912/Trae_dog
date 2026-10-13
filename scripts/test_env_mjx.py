@@ -258,23 +258,29 @@ def test_dr_smoke():
     state, obs = env.reset(jax.random.PRNGKey(0))
     log(f"  reset 完成，耗时 {time.time()-t0:.1f}s")
 
-    # 4a: reset 后 env 间有差异
+    # 4a: 模型级 DR 现为「整批共享标量」（2026-10-13 性能重构：模型按 env 批化
+    #     会让 mjx.step 慢 31 倍）。env 间差异只来自初态扰动/动作延迟/指令
     dr = state.dr
     fric_std = float(np.asarray(dr.fric).std())
     mass_std = float(np.asarray(dr.mass_scale).std())
     kp_std = float(np.asarray(dr.kp_scale).std())
-    print(f"  4a. DR 参数 env 间 std: fric={fric_std:.4f}, "
+    print(f"  4a. 模型级 DR 整批共享（std 应为 0）: fric={fric_std:.4f}, "
           f"mass={mass_std:.4f}, kp={kp_std:.4f}")
+    print(f"      本 rollout 模型级 DR 标量: "
+          f"fric={float(np.asarray(dr.fric)[0]):.3f}, "
+          f"mass={float(np.asarray(dr.mass_scale)[0]):.3f}, "
+          f"kp={float(np.asarray(dr.kp_scale)[0]):.3f}, "
+          f"kv={float(np.asarray(dr.kv_scale)[0]):.3f}")
     obs_np = np.asarray(obs)
     obs_std = float(obs_np.std(axis=0).max())
     print(f"      obs env 间最大 std = {obs_std:.6f}")
-    ok_diff = (fric_std > 1e-6 and mass_std > 1e-6
-               and kp_std > 1e-6 and obs_std > 1e-6)
+    ok_diff = (fric_std < 1e-6 and mass_std < 1e-6 and kp_std < 1e-6
+               and obs_std > 1e-6)
 
     # 4b: 跑 10 步无 NaN
     actions = jnp.zeros((4, 12))
     has_nan = False
-    log("  第一次 step（dr=True 含 _apply_dr，需编译）...")
+    log("  第一次 step（dr=True，含 build_model 外层 DR，需编译）...")
     t0 = time.time()
     state, obs, rew, term, trunc, info = env.step(state, actions)
     log(f"  step 编译完成，耗时 {time.time()-t0:.1f}s")

@@ -71,8 +71,11 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
     返回 dict: obs_61 (n_steps*n_envs, 61), mu_teacher, v_teacher
     """
     obs_list, mu_list, v_list = [], [], []
-    rng, reset_rng = jax.random.split(rng)
-    state, obs = env.reset(reset_rng)
+    rng, reset_rng, k_dr = jax.random.split(rng, 3)
+    # 模型级 DR 在 vmap 外层注入（本 rollout 标量，整批 env 共享）
+    dr_model = env.resample_dr(k_dr)
+    mx_model = env.build_model(dr_model)
+    state, obs = env.reset(reset_rng, dr_model)
     priv = env.get_privileged_obs(state)
     teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
@@ -83,14 +86,14 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
         v_list.append(value)
 
         action = jnp.clip(mu, -1.0, 1.0)  # 蒸馏阶段用确定性动作
-        state, obs, reward, term, trunc, info = env.step(state, action)
+        state, obs, reward, term, trunc, info = env.step(state, action, mx_model)
         done = jnp.logical_or(term, trunc)
         priv = info["privileged_obs"]
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
         # auto-reset
         rng, reset_rng = jax.random.split(rng)
-        fresh_state, fresh_obs = env.reset(reset_rng)
+        fresh_state, fresh_obs = env.reset(reset_rng, dr_model)
         state = tree_where_done(done, fresh_state, state)
         obs = tree_where_done(done, fresh_obs, obs)
         priv = env.get_privileged_obs(state)

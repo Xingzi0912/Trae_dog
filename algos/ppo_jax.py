@@ -223,7 +223,12 @@ def make_update(env, config: PPOConfig, tx):
 
     jit_update 参数（签名跨 update 完全稳定，不会重编译）：
         state, teacher_obs, rng, params, opt_state,
-        obs_mean, obs_var, obs_count, lr_t
+        obs_mean, obs_var, obs_count, lr_t, dr_model
+    模型级 DR（dr_model）：由 train() 每个 update 重采样的**标量** DRParams，
+    在 jit 内经 env.build_model 构建成**非批化**单模型、以 in_axes=None 广播给
+    整批 env——模型一旦按 env 批化，mjx.step 快路径即失效（慢 31 倍，见
+    dog_env_mjx.py 文件头）。这里必须走参数而非闭包常量，否则每次重采样都会让
+    常量变化 → mega-jit 重编译。
     返回：(state, teacher_obs, rng, params, opt_state,
            obs_mean, obs_var, obs_count) 8 元 carry, metrics
         metrics: reward 标量；kl/entropy/value_loss/policy_loss/active
@@ -242,7 +247,10 @@ def make_update(env, config: PPOConfig, tx):
 
     @jax.jit
     def jit_update(state, teacher_obs, rng, params, opt_state,
-                   obs_mean, obs_var, obs_count, lr_t):
+                   obs_mean, obs_var, obs_count, lr_t, dr_model):
+        # 模型级 DR 在 vmap 外层注入：非批化单模型（保住 mjx.step 快路径）
+        mx_model = env.build_model(dr_model)
+
         # ---------- 1. rollout（obs_rms 本批内固定）----------
         def scan_step(carry, _):
             st, tobs, k = carry
@@ -255,10 +263,10 @@ def make_update(env, config: PPOConfig, tx):
             action = jnp.clip(action, -1.0, 1.0)
             log_prob = gaussian_log_prob(action, mu, std)
             # env step + auto-reset
-            st, obs, rew, term, trunc, info = env.step(st, action)
+            st, obs, rew, term, trunc, info = env.step(st, action, mx_model)
             done = jnp.logical_or(term, trunc)
             tobs_new = make_teacher_obs(obs, info["privileged_obs"])
-            fresh_st, fresh_obs = env.reset(k_reset)
+            fresh_st, fresh_obs = env.reset(k_reset, dr_model)
             fresh_tobs = make_teacher_obs(fresh_obs,
                                           env.get_privileged_obs(fresh_st))
             st = tree_where_done(done, fresh_st, st)
@@ -373,9 +381,10 @@ def train(rng, env, config: PPOConfig,
     actor_forward = jax.jit(
         lambda params, obs: make_teacher().apply(params, obs))
 
-    # reset
-    rng, reset_rng = jax.random.split(rng)
-    state, obs = env.reset(reset_rng)
+    # reset（先采样本 rollout 的标量模型级 DR，整批 env 共享）
+    rng, reset_rng, k_dr = jax.random.split(rng, 3)
+    dr_model = env.resample_dr(k_dr)
+    state, obs = env.reset(reset_rng, dr_model)
     priv = env.get_privileged_obs(state)
     teacher_obs = make_teacher_obs(obs, priv)
 
@@ -391,19 +400,20 @@ def train(rng, env, config: PPOConfig,
     # teacher_obs 含 IMU(~10) / 关节角(~1) / 特权信息，尺度差异大；
     # 若不 warmup，第一次梯度更新会让网络输出剧变 → 第二次 rollout KL 偏高
     log_fn("  obs_rms warmup...")
+    mx_model = env.build_model(dr_model)
     for _ in range(config.rollout_len):
         teacher_obs_norm = obs_rms.normalize(teacher_obs)
         mu, std, _ = actor_forward(ts.params, teacher_obs_norm)
         rng, act_rng = jax.random.split(rng)
         action = mu + std * jax.random.normal(act_rng, mu.shape)
         action = jnp.clip(action, -1.0, 1.0)
-        state, obs, _, _, _, info = env.step(state, action)
+        state, obs, _, _, _, info = env.step(state, action, mx_model)
         priv = info["privileged_obs"]
         teacher_obs = make_teacher_obs(obs, priv)
         obs_rms = obs_rms.update(teacher_obs)
     # warmup 后 reset，避免初始 transient 状态污染第一个真实 rollout
     rng, reset_rng = jax.random.split(rng)
-    state, obs = env.reset(reset_rng)
+    state, obs = env.reset(reset_rng, dr_model)
     priv = env.get_privileged_obs(state)
     teacher_obs = make_teacher_obs(obs, priv)
     log_fn(f"  obs_rms warmup done: mean|obs|={float(jnp.abs(obs_rms.mean).mean()):.3f}, "
@@ -416,13 +426,17 @@ def train(rng, env, config: PPOConfig,
     params, opt_state = ts.params, ts.opt_state
     for update in range(n_updates):
         t0 = time.time()
+        # 每个 update 重采样一份标量模型级 DR（跨 update 覆盖 DR 分布；
+        # 显式传参而非闭包常量，保证 mega-jit 不重编译）
+        rng, k_dr = jax.random.split(rng)
+        dr_model = env.sample_model_dr(k_dr)
 
         lr_t = jnp.float32(
             config.lr * max(0.0, 1.0 - update * batch_size
                             / config.anneal_steps))
         carry_out, m = jit_update(
             state, teacher_obs, rng, params, opt_state,
-            obs_rms.mean, obs_rms.var, obs_rms.count, lr_t)
+            obs_rms.mean, obs_rms.var, obs_rms.count, lr_t, dr_model)
         (state, teacher_obs, rng, params, opt_state,
          o_mean, o_var, o_count) = carry_out
         obs_rms = RunningMeanStd(mean=o_mean, var=o_var, count=o_count)
