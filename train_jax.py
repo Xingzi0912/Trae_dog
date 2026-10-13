@@ -143,7 +143,13 @@ def main():
                         help="禁用残差模式（纯 PPO 从零学走路）")
     parser.add_argument("--no_dr", action="store_true",
                         help="禁用域随机化")
+    parser.add_argument("--mem", type=float, default=None,
+                        help="XLA 显存占比 0.0-1.0（覆盖环境变量）")
     args = parser.parse_args()
+
+    # --mem 覆盖环境变量
+    if args.mem is not None:
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.mem)
 
     # --- 设备检测 ---
     devices = jax.devices()
