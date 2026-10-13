@@ -10,7 +10,15 @@
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
+# 直接 `python3 scripts/xxx.py` 时 sys.path[0] 是 scripts/，仓库根不在路径里，
+# 需手动补入才能 import envs/algos（`python -m scripts.xxx` 则自带）
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import jax
 import jax.numpy as jnp
