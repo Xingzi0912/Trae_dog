@@ -72,7 +72,7 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
     """
     obs_list, mu_list, v_list = [], [], []
     rng, reset_rng, k_dr = jax.random.split(rng, 3)
-    # 模型级 DR 在 vmap 外层注入（本 rollout 标量，整批 env 共享）
+    # 模型级 DR 在 vmap 外层注入（K=1 整批共享一份；K>1 按池共享，见 env 文件头）
     dr_model = env.resample_dr(k_dr)
     mx_model = env.build_model(dr_model)
     state, obs = env.reset(reset_rng, dr_model)

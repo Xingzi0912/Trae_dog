@@ -18,15 +18,18 @@
      （100~200 策略步）重采样，17% 概率零指令（决策 5.2）。课程收缩由训练脚本
      通过 EnvConfig 的 cmd_* 范围参数实现，环境本身始终按给定范围采样
   5. 奖励改速度跟踪高斯（决策 5.3），v1 不加步态相位/腾空奖励
-  6. DR 分两层（2026-10-13 重构，纯性能原因）：
-     a) 模型级（摩擦/质量/kp/kv）在 vmap **外层**注入：每次 rollout 由训练脚本
-        采样一份**标量** DR（sample_model_dr），env.build_model(dr) 得到
-        **非批化**的单个 mjx.Model，再以 in_axes=None 广播给整批 env。
-        实测（probe_batch，N=2048）：模型一旦按 env 批化——无论全批化 (0,0)
-        还是旧版「vmap 内 replace」的混批——mjx.step 快路径立即失效，吞吐从
-        21,000 掉到 ~660 env·物理子步/s（31 倍）；共享非批化模型则 20,963。
-        代价：同一 rollout 内整批 env 共享同一份模型级 DR（分布仍跨 update 覆盖）。
-     b) 便宜的 per-env DR 全部保留：初态扰动/动作延迟(0~2 策略步)/观测噪声/
+  6. DR 分两层（2026-10-13 重构 + K 池化，纯性能原因）：
+     a) 模型级（摩擦/质量/kp/kv）在 vmap **外层**注入。实测（probe_batch，N=2048）：
+        模型一旦按 env 批化——无论全批化 (0,0) 还是旧版「vmap 内 replace」的混批
+        ——mjx.step 快路径立即失效，吞吐从 21,000 掉到 ~660 env·物理子步/s（31 倍）；
+        共享**非批化**模型（in_axes=None 广播）则 20,963。
+     b) 为在保住快路径的同时恢复 DR 多样度，引入 **K 池化**（EnvConfig.dr_pools=K）：
+        外层 K 份池模型（vmap 出按池批化的 (K,...) 模型），池内 n_envs/K 个 env 共享
+        一份；state/obs 对外仍是 (N,)，仅 K>1 时内部 reshape 成 (K, N/K)。
+        实测 K∈{128,256,512} 仍是快路径（~1.2x 开销），K∈{8,32,64} 或 K=2048
+        （=per-env 全批化）掉慢路径（见 scripts/bench_mjx_throughput.py）。
+        K=1 即 a) 的「整批共享」路径（最快，无 DR 多样度）；训练默认 K=256。
+     c) 便宜的 per-env DR 全部保留：初态扰动/动作延迟(0~2 策略步)/观测噪声/
         指令采样都在 Data/state 里逐 env 采样，与模型无关
 
 观测布局（61 维，除 base_z 外全部机身系）：
@@ -104,6 +107,11 @@ class EnvConfig:
     upright_thresh: float = 0.39    # |g_x|,|g_y| < sin(0.4rad)，与旧阈值等价
     # 域随机化
     dr_enabled: bool = True
+    # 模型级 DR 池数 K：1=整批 env 共享一份（最快，无 DR 多样度）；K>1=外层 K 份
+    # 池模型、池内 n_envs/K 个 env 共享（DR 多样度=K）。实测 2048 env 下
+    # K∈{128,256,512} 仍走快路径（~1.2x 开销），K∈{8,32,64,2048} 掉慢路径（见
+    # scripts/bench_mjx_throughput.py --modes kpool）
+    dr_pools: int = 1
     friction_range: tuple = (0.5, 1.8)     # floor geom friction[0] 绝对值
     base_mass_range: tuple = (0.8, 1.2)    # base_link 质量乘性
     kp_scale_range: tuple = (0.8, 1.2)
@@ -187,6 +195,9 @@ class DogEnvMJX:
                  scene_path: str = None):
         self.n_envs = int(n_envs)
         self.cfg = config or EnvConfig()
+        self.n_pools = int(self.cfg.dr_pools)
+        assert self.n_pools >= 1 and self.n_envs % self.n_pools == 0, \
+            f"dr_pools={self.n_pools} 必须整除 n_envs={self.n_envs}"
         if scene_path is None:
             scene_path = str(Path(__file__).parent / "scene_mjx.xml")
 
@@ -241,17 +252,19 @@ class DogEnvMJX:
             np.zeros(3),                       # 58:61 指令（自身已知量）
         ]).astype(np.float32))
 
-        self._reset_batch = jax.jit(jax.vmap(self._reset_one, in_axes=(0, None)))
-        self._step_batch = jax.jit(jax.vmap(self._step_one, in_axes=(None, 0, 0)))
+        # reset/step 的 jit 目标内部按 n_pools 静态分支：K=1 → 单层 vmap + 标量
+        # DR；K>1 → 外层 K 池嵌套 vmap（池内共享一份池模型）
+        self._reset_batch = jax.jit(self._reset_impl)
+        self._step_batch = jax.jit(self._step_impl)
         # 当前 rollout 的模型级 DR（脚本/单测走这两个默认值；训练脚本每 update
         # 显式 resample/传参，避免闭包常量随 update 变化触发 mega-jit 重编译）
         self.resample_dr(jax.random.PRNGKey(0))
 
     # --------------------------------------------------------------
-    # 模型级 DR（vmap 外层，标量）——见文件头「关键差异 6」
+    # 模型级 DR（vmap 外层，标量 K=1 或 (K,) 池化）——见文件头「关键差异 6」
     # --------------------------------------------------------------
-    def sample_model_dr(self, key: jax.Array) -> DRParams:
-        """采样一份**标量**模型级 DR（整批 env 共享，整 rollout 恒定）"""
+    def _sample_one_dr(self, key: jax.Array) -> DRParams:
+        """采样**一份标量**模型级 DR（池内共享，整 rollout 恒定）"""
         cfg = self.cfg
         if not cfg.dr_enabled:
             return DRParams(fric=self._nom_floor_fric, mass_scale=jnp.float32(1.0),
@@ -268,17 +281,70 @@ class DogEnvMJX:
                                         maxval=cfg.kv_scale_range[1]),
         )
 
+    def sample_model_dr(self, key: jax.Array, k: int = None) -> DRParams:
+        """采样 K=n_pools 份模型级 DR（跨 update 覆盖 DR 分布，整 rollout 恒定）
+
+        K=1 → 标量叶子（非批化模型，用 in_axes=None 广播）；
+        K>1 → 叶子形状 (K,)，每份供一个池使用（见 build_model / _reset_impl）
+        """
+        k = self.n_pools if k is None else int(k)
+        if k == 1:
+            return self._sample_one_dr(key)
+        return jax.vmap(self._sample_one_dr)(jax.random.split(key, k))
+
     def build_model(self, dr_model: DRParams) -> mjx.Model:
-        """把标量 DR 注入共享模型 → **非批化**单模型（必须 in_axes=None 广播）"""
-        if not self.cfg.dr_enabled:
-            return self._mx
-        return self._apply_dr(self._mx, dr_model)
+        """把模型级 DR 注入共享模型 → 供 reset/step 使用的模型
+
+        n_pools=1 → 标量 DR → **非批化单模型**（in_axes=None 广播给整批 env）；
+        n_pools>1 → (K,) DR → vmap 出**按池批化**的 (K,...) 模型，配合
+        _step_impl 的嵌套 vmap（外层 K 池、池内共享一份池模型）。
+        实测 2048 env：K∈{128,256,512} 仍是快路径（~1.2x），K=1 最快。
+        """
+        if self.n_pools == 1:
+            return self._mx if not self.cfg.dr_enabled \
+                else self._apply_dr(self._mx, dr_model)
+        return jax.vmap(self._apply_dr, in_axes=(None, 0))(self._mx, dr_model)
 
     def resample_dr(self, key: jax.Array) -> DRParams:
         """重采样本 rollout 的模型级 DR（脚本/单测便捷入口，会改 env 属性）"""
         self._dr_model = self.sample_model_dr(key)
         self._mx_eff = self.build_model(self._dr_model)
         return self._dr_model
+
+    # --------------------------------------------------------------
+    # 池化：外部 state/obs 始终 (N,)；内部 K>1 时才 reshape 成 (K, N/K)
+    # --------------------------------------------------------------
+    def _to_pool(self, x):
+        """(N, ...) → (K, N/K, ...)"""
+        k = self.n_pools
+        return jax.tree_util.tree_map(
+            lambda a: a.reshape((k, self.n_envs // k) + a.shape[1:]), x)
+
+    def _from_pool(self, x):
+        """(K, N/K, ...) → (N, ...)"""
+        return jax.tree_util.tree_map(
+            lambda a: a.reshape((self.n_envs,) + a.shape[2:]), x)
+
+    def _reset_impl(self, keys: jax.Array, dr: DRParams):
+        """jit 目标：K=1 → 单层 vmap 广播标量 DR；K>1 → 外层 K 池、池内共享"""
+        if self.n_pools == 1:
+            return jax.vmap(self._reset_one, in_axes=(0, None))(keys, dr)
+        k = self.n_pools
+        kk = keys.reshape((k, self.n_envs // k) + keys.shape[1:])
+        state, obs = jax.vmap(
+            jax.vmap(self._reset_one, in_axes=(0, None)),
+            in_axes=(0, 0))(kk, dr)
+        return self._from_pool(state), self._from_pool(obs)
+
+    def _step_impl(self, mx: mjx.Model, state: EnvState, action: jax.Array):
+        """jit 目标：K=1 → 单层 vmap 广播单模型；K>1 → 外层 K 池、池内共享"""
+        if self.n_pools == 1:
+            return jax.vmap(self._step_one, in_axes=(None, 0, 0))(
+                mx, state, action)
+        out = jax.vmap(
+            jax.vmap(self._step_one, in_axes=(None, 0, 0)),
+            in_axes=(0, 0, 0))(mx, self._to_pool(state), self._to_pool(action))
+        return self._from_pool(out)
 
     # --------------------------------------------------------------
     # 对外 API（rng 单 key 传入，内部分拆到 n_envs）
@@ -292,7 +358,8 @@ class DogEnvMJX:
         """action (n_envs,12) → (state, obs, reward, terminated, truncated, info)
 
         mx_model 缺省用 self._mx_eff；训练时由 mega-jit 内的上层传入（见
-        ppo_jax.make_update），保证模型是「非批化 + 显式参数」而非闭包常量。
+        ppo_jax.make_update），保证模型走显式参数而非闭包常量（否则随 update 变化
+        的模型会触发 mega-jit 重编译）。K>1 时为按池批化的 (K,...) 模型。
         """
         mx_model = self._mx_eff if mx_model is None else mx_model
         return self._step_batch(mx_model, state, action)

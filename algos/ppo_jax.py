@@ -248,7 +248,8 @@ def make_update(env, config: PPOConfig, tx):
     @jax.jit
     def jit_update(state, teacher_obs, rng, params, opt_state,
                    obs_mean, obs_var, obs_count, lr_t, dr_model):
-        # 模型级 DR 在 vmap 外层注入：非批化单模型（保住 mjx.step 快路径）
+        # 模型级 DR 在 vmap 外层注入：K=1 得非批化单模型、K>1 得按池批化 (K,...)
+        # 模型（均保住 mjx.step 快路径，见 envs/dog_env_mjx.py 文件头「关键差异 6」）
         mx_model = env.build_model(dr_model)
 
         # ---------- 1. rollout（obs_rms 本批内固定）----------
@@ -381,7 +382,7 @@ def train(rng, env, config: PPOConfig,
     actor_forward = jax.jit(
         lambda params, obs: make_teacher().apply(params, obs))
 
-    # reset（先采样本 rollout 的标量模型级 DR，整批 env 共享）
+    # reset（先采样本 rollout 的 K 份模型级 DR；K=1 即整批 env 共享一份）
     rng, reset_rng, k_dr = jax.random.split(rng, 3)
     dr_model = env.resample_dr(k_dr)
     state, obs = env.reset(reset_rng, dr_model)
@@ -426,7 +427,7 @@ def train(rng, env, config: PPOConfig,
     params, opt_state = ts.params, ts.opt_state
     for update in range(n_updates):
         t0 = time.time()
-        # 每个 update 重采样一份标量模型级 DR（跨 update 覆盖 DR 分布；
+        # 每个 update 重采样 K 份模型级 DR（跨 update 覆盖 DR 分布；
         # 显式传参而非闭包常量，保证 mega-jit 不重编译）
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)

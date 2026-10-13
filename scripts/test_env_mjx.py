@@ -4,7 +4,7 @@
 1. 一致性：同 XML 下 CPU 循环 vs MJX 环境，零策略 100 步逐对比观测（对齐阶段1阈值）
 2. 语义点检：站立时 g_b=[0,0,-1]、obs[7:10]==CPU qvel[3:6]、1000 步零策略不塌
 3. 指令重采样：4 env 跑 300 步，每个 env 的 command 至少变一次
-4. DR 冒烟：4 env 开 DR，reset 后 env 间有差异、10 步无 NaN
+4. DR 冒烟：4 env 开 DR + dr_pools=2，池内 DR 相同、池间不同、obs 有差异、10 步无 NaN
 
 用法（项目根目录）：python scripts/test_env_mjx.py
 """
@@ -256,32 +256,32 @@ def test_command_resample():
 # 检查项 4：DR 冒烟
 # ---------------------------------------------------------------------------
 def test_dr_smoke():
-    print("\n=== 检查项 4：DR 冒烟（4 env，开 DR）===")
-    log("  构建 DogEnvMJX(n_envs=4, dr=True) ...")
-    env = DogEnvMJX(n_envs=4, config=EnvConfig(dr_enabled=True))
+    print("\n=== 检查项 4：DR 冒烟（4 env，开 DR，dr_pools=2）===")
+    log("  构建 DogEnvMJX(n_envs=4, dr=True, dr_pools=2) ...")
+    env = DogEnvMJX(n_envs=4, config=EnvConfig(dr_enabled=True, dr_pools=2))
     log("  reset（dr=True 新控制流，需编译）...")
     t0 = time.time()
     state, obs = env.reset(jax.random.PRNGKey(0))
     log(f"  reset 完成，耗时 {time.time()-t0:.1f}s")
 
-    # 4a: 模型级 DR 现为「整批共享标量」（2026-10-13 性能重构：模型按 env 批化
-    #     会让 mjx.step 慢 31 倍）。env 间差异只来自初态扰动/动作延迟/指令
-    dr = state.dr
-    fric_std = float(np.asarray(dr.fric).std())
-    mass_std = float(np.asarray(dr.mass_scale).std())
-    kp_std = float(np.asarray(dr.kp_scale).std())
-    print(f"  4a. 模型级 DR 整批共享（std 应为 0）: fric={fric_std:.4f}, "
-          f"mass={mass_std:.4f}, kp={kp_std:.4f}")
-    print(f"      本 rollout 模型级 DR 标量: "
-          f"fric={float(np.asarray(dr.fric)[0]):.3f}, "
-          f"mass={float(np.asarray(dr.mass_scale)[0]):.3f}, "
-          f"kp={float(np.asarray(dr.kp_scale)[0]):.3f}, "
-          f"kv={float(np.asarray(dr.kv_scale)[0]):.3f}")
+    # 4a: 模型级 DR 现为 K 池化（2026-10-13 性能重构：per-env 批化模型会让
+    #     mjx.step 慢 31 倍，故用 K 份池模型、池内共享）。dr_pools=2 → env{0,1}
+    #     共享池 0、env{2,3} 共享池 1：池内相同、池间不同；obs 差异还含初态扰动等
+    f_all = np.asarray(state.dr.fric)
+    m_all = np.asarray(state.dr.mass_scale)
+    kp_all = np.asarray(state.dr.kp_scale)
+    kv_all = np.asarray(state.dr.kv_scale)
+    print(f"  4a. per-env 模型级 DR: fric={np.round(f_all, 3)}, "
+          f"mass={np.round(m_all, 3)}")
+    print(f"      kp={np.round(kp_all, 3)}, kv={np.round(kv_all, 3)}")
+    same_in_pool = bool((f_all[0] == f_all[1] and f_all[2] == f_all[3])
+                        and (m_all[0] == m_all[1] and m_all[2] == m_all[3]))
+    diff_across = bool(f_all[0] != f_all[2] or m_all[0] != m_all[2])
+    print(f"      池内相同={same_in_pool}, 池间不同={diff_across}")
     obs_np = np.asarray(obs)
     obs_std = float(obs_np.std(axis=0).max())
     print(f"      obs env 间最大 std = {obs_std:.6f}")
-    ok_diff = (fric_std < 1e-6 and mass_std < 1e-6 and kp_std < 1e-6
-               and obs_std > 1e-6)
+    ok_diff = same_in_pool and diff_across and obs_std > 1e-6
 
     # 4b: 跑 10 步无 NaN
     actions = jnp.zeros((4, 12))

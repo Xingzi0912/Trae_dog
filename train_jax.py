@@ -143,6 +143,10 @@ def main():
                         help="禁用残差模式（纯 PPO 从零学走路）")
     parser.add_argument("--no_dr", action="store_true",
                         help="禁用域随机化")
+    parser.add_argument("--dr_pools", type=int, default=256,
+                        help="模型级 DR 池数 K：1=整批共享（最快，无 DR 多样度）；"
+                             "K∈{128,256,512} 仍走 mjx 快路径（~1.2x），恢复 K 份 "
+                             "DR 多样度。须整除 n_envs，否则回退 1（关 DR 时恒为 1）")
     parser.add_argument("--mem", type=float, default=None,
                         help="XLA 显存占比 0.0-1.0（覆盖环境变量）")
     args = parser.parse_args()
@@ -184,11 +188,19 @@ def main():
         n_minibatches = args.n_minibatches
 
     # --- 环境 ---
+    # 模型级 DR 池数 K：关 DR 时恒为 1（否则 build_model 会走批化慢路径）；
+    # K>1 时须整除 n_envs，否则回退 1
+    dr_pools = 1 if args.no_dr else args.dr_pools
+    if dr_pools > 1 and n_envs % dr_pools != 0:
+        log(f"⚠️ dr_pools={dr_pools} 不整除 n_envs={n_envs}，回退 dr_pools=1")
+        dr_pools = 1
     env_cfg = EnvConfig(
         dr_enabled=not args.no_dr,
         use_residual=not args.no_residual,
+        dr_pools=dr_pools,
     )
-    log(f"env: residual={env_cfg.use_residual}, dr={env_cfg.dr_enabled}")
+    log(f"env: residual={env_cfg.use_residual}, dr={env_cfg.dr_enabled}, "
+        f"dr_pools={env_cfg.dr_pools}")
     env = DogEnvMJX(n_envs=n_envs, config=env_cfg)
 
     rng = jax.random.PRNGKey(42)
