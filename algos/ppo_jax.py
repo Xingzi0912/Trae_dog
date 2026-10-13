@@ -226,11 +226,12 @@ def train(rng, env, config: PPOConfig,
     for update in range(n_updates):
         t0 = time.time()
         rollout_obs, rollout_act, rollout_lp, rollout_val = [], [], [], []
-        rollout_rew, rollout_done = [], []
+        rollout_rew, rollout_done, rollout_obs_raw = [], [], []
 
         # --- rollout 收集（Python 循环，每步走 JIT'd env.step + actor_forward）---
         for t in range(config.rollout_len):
-            mu, std, value = actor_forward(ts.params, teacher_obs)
+            teacher_obs_norm = obs_rms.normalize(teacher_obs)
+            mu, std, value = actor_forward(ts.params, teacher_obs_norm)
             rng, act_rng = jax.random.split(rng)
             action = mu + std * jax.random.normal(act_rng, mu.shape)
             log_prob = gaussian_log_prob(action, mu, std)
@@ -241,7 +242,8 @@ def train(rng, env, config: PPOConfig,
             priv = info["privileged_obs"]
             teacher_obs = make_teacher_obs(obs, priv)
 
-            rollout_obs.append(teacher_obs)
+            rollout_obs.append(teacher_obs_norm)
+            rollout_obs_raw.append(teacher_obs)
             rollout_act.append(action)
             rollout_lp.append(log_prob)
             rollout_val.append(value)
@@ -257,7 +259,7 @@ def train(rng, env, config: PPOConfig,
             teacher_obs = make_teacher_obs(obs, priv)
 
         # --- GAE ---
-        _, _, last_value = actor_forward(ts.params, teacher_obs)
+        _, _, last_value = actor_forward(ts.params, obs_rms.normalize(teacher_obs))
         obs_arr = jnp.stack(rollout_obs)
         act_arr = jnp.stack(rollout_act)
         lp_arr = jnp.stack(rollout_lp)
@@ -269,7 +271,7 @@ def train(rng, env, config: PPOConfig,
             rew_arr, val_arr, done_arr, last_value,
             config.gamma, config.gae_lambda)
 
-        obs_rms = obs_rms.update(obs_arr)
+        obs_rms = obs_rms.update(jnp.stack(rollout_obs_raw))
 
         # --- PPO update ---
         batch = {
