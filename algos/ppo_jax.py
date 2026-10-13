@@ -166,7 +166,7 @@ def compute_gae(rewards, values, dones, last_value,
 
     _, advantages = jax.lax.scan(
         scan_fn, (jnp.zeros(N), last_value),
-        None, length=T, reverse=True)
+        jnp.arange(T), reverse=True)
     returns = advantages + values
     return advantages, returns
 
