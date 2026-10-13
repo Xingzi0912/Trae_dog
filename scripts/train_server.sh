@@ -37,6 +37,14 @@ done
 # GPU 显存限制
 export XLA_PYTHON_CLIENT_MEM_FRACTION=$MEM
 
+# mem=1.0 会导致 OOM：GPU 驱动/CUDA 上下文占了 ~500MB-1GB，
+# JAX 试图占 100% 永远达不到 → 分配失败。建议 ≤0.9
+if (( $(echo "$MEM > 0.95" | bc -l) )); then
+    echo "⚠️  警告：--mem $MEM > 0.95 几乎必然 OOM（GPU 驱动占用无法释放）"
+    echo "   建议用 --mem 0.9（留 ~2.4GB 给驱动/CUDA 上下文）"
+    echo ""
+fi
+
 echo "=== dog_rl 服务器训练 ==="
 echo "steps=$STEPS, n_envs=$N_ENVS, mem=$MEM"
 echo ""

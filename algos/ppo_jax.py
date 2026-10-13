@@ -178,6 +178,63 @@ def create_train_state(rng, tx):
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
 
+def make_scan_rollout(env, config: PPOConfig):
+    """构造 JIT'd scan rollout（消除 Python 循环的 host-device 同步）
+
+    性能修复（2026-10-13）：Python 循环 rollout 每步 4+ 次 JIT'd 调用打断
+    JAX 异步执行触发同步 + 每步调 env.reset(2048 envs)，dt=1149s/update。
+    scan 化后 24 步在 GPU 上一次循环完成，无 Python 同步，预期 dt 降到几秒
+    （MJX 官方示例 / Walk in the Park 的标准做法）。
+
+    carry: (state, teacher_obs, rng, params, obs_mean, obs_var)
+    输出: (obs_norm, action, log_prob, value, reward, done, obs_raw)
+    """
+    model = make_teacher()
+    rollout_len = config.rollout_len
+
+    def scan_step(carry, _):
+        state, teacher_obs, rng, params, obs_mean, obs_var = carry
+
+        # normalize（obs_rms 在 rollout 期间固定，rollout 结束后才更新）
+        teacher_obs_norm = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+
+        # policy forward
+        mu, std, value = model.apply(params, teacher_obs_norm)
+
+        # sample action（先 clip 再算 log_prob，与 ppo_loss 一致）
+        rng, act_rng, reset_rng = jax.random.split(rng, 3)
+        action = mu + std * jax.random.normal(act_rng, mu.shape)
+        action = jnp.clip(action, -1.0, 1.0)
+        log_prob = gaussian_log_prob(action, mu, std)
+
+        # env step
+        state, obs, reward, term, trunc, info = env.step(state, action)
+        done = jnp.logical_or(term, trunc)
+        priv = info["privileged_obs"]
+        teacher_obs_new = make_teacher_obs(obs, priv)
+
+        # auto-reset：每步对 done 的 env 用 fresh state 替换
+        # （fresh_state 每步重新采样，不同 env 用不同 reset_rng → 不同初态）
+        fresh_state, fresh_obs = env.reset(reset_rng)
+        fresh_priv = env.get_privileged_obs(fresh_state)
+        fresh_teacher_obs = make_teacher_obs(fresh_obs, fresh_priv)
+        state = tree_where_done(done, fresh_state, state)
+        teacher_obs_out = tree_where_done(done, fresh_teacher_obs,
+                                          teacher_obs_new)
+
+        new_carry = (state, teacher_obs_out, rng, params,
+                     obs_mean, obs_var)
+        output = (teacher_obs_norm, action, log_prob, value, reward,
+                  done, teacher_obs_new)
+        return new_carry, output
+
+    @jax.jit
+    def scan_rollout(carry):
+        return jax.lax.scan(scan_step, carry, None, length=rollout_len)
+
+    return scan_rollout
+
+
 # ---------------------------------------------------------------------------
 # 训练主循环
 # ---------------------------------------------------------------------------
@@ -245,58 +302,31 @@ def train(rng, env, config: PPOConfig,
     log_fn(f"  obs_rms warmup done: mean|obs|={float(jnp.abs(obs_rms.mean).mean()):.3f}, "
            f"mean|var|={float(obs_rms.var.mean()):.3f}")
 
+    # scan 化 rollout（JIT 编译一次，消除 Python 循环的 host-device 同步）
+    scan_rollout = make_scan_rollout(env, config)
+    log_fn("  scan_rollout JIT 编译中（首次会较慢）...")
+
     for update in range(n_updates):
         t0 = time.time()
-        rollout_obs, rollout_act, rollout_lp, rollout_val = [], [], [], []
-        rollout_rew, rollout_done, rollout_obs_raw = [], [], []
 
-        # --- rollout 收集（Python 循环，每步走 JIT'd env.step + actor_forward）---
-        for t in range(config.rollout_len):
-            teacher_obs_norm = obs_rms.normalize(teacher_obs)
-            mu, std, value = actor_forward(ts.params, teacher_obs_norm)
-            rng, act_rng = jax.random.split(rng)
-            action_raw = mu + std * jax.random.normal(act_rng, mu.shape)
-            action = jnp.clip(action_raw, -1.0, 1.0)
-            # 关键：用 clip 后的 action 算 log_prob（与 ppo_loss 的 batch["action"] 一致）
-            # 否则被 clip 的维度 old_log_prob 用 clip 前的 action（距 mu 远，log_prob 很负），
-            # new_log_prob 用 clip 后的 action（距 mu 近），ratio=exp(正大数)→ KL 爆炸
-            log_prob = gaussian_log_prob(action, mu, std)
-
-            state, obs, reward, term, trunc, info = env.step(state, action)
-            done = jnp.logical_or(term, trunc)
-            priv = info["privileged_obs"]
-            teacher_obs = make_teacher_obs(obs, priv)
-
-            rollout_obs.append(teacher_obs_norm)
-            rollout_obs_raw.append(teacher_obs)
-            rollout_act.append(action)
-            rollout_lp.append(log_prob)
-            rollout_val.append(value)
-            rollout_rew.append(reward)
-            rollout_done.append(done)
-
-            # auto-reset（done 的 env 用 fresh 替换）
-            rng, reset_rng = jax.random.split(rng)
-            fresh_state, fresh_obs = env.reset(reset_rng)
-            state = tree_where_done(done, fresh_state, state)
-            obs = tree_where_done(done, fresh_obs, obs)
-            priv = env.get_privileged_obs(state)
-            teacher_obs = make_teacher_obs(obs, priv)
+        # --- scan 化 rollout（24 步在 GPU 上一次循环，无 Python 同步）---
+        carry = (state, teacher_obs, rng, ts.params,
+                 obs_rms.mean, obs_rms.var)
+        carry, rollout_out = scan_rollout(carry)
+        state, teacher_obs, rng, _, _, _ = carry
+        # rollout_out: (obs_norm, action, log_prob, value, reward, done, obs_raw)
+        # 每个 shape (T, N, ...)
+        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, obs_raw_arr = \
+            rollout_out
 
         # --- GAE ---
-        _, _, last_value = actor_forward(ts.params, obs_rms.normalize(teacher_obs))
-        obs_arr = jnp.stack(rollout_obs)
-        act_arr = jnp.stack(rollout_act)
-        lp_arr = jnp.stack(rollout_lp)
-        val_arr = jnp.stack(rollout_val)
-        rew_arr = jnp.stack(rollout_rew)
-        done_arr = jnp.stack(rollout_done)
-
+        _, _, last_value = actor_forward(ts.params,
+                                         obs_rms.normalize(teacher_obs))
         advantages, returns = compute_gae(
             rew_arr, val_arr, done_arr, last_value,
             config.gamma, config.gae_lambda)
 
-        obs_rms = obs_rms.update(jnp.stack(rollout_obs_raw))
+        obs_rms = obs_rms.update(obs_raw_arr)
 
         # --- PPO update ---
         batch = {
