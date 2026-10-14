@@ -65,6 +65,9 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
+    value_clip_eps: float = 1.0  # v9 判决：与 ratio clip 解耦。0.2 时 critic
+    # 每 update 最多向目标移 0.2，初始 2.5 偏差关不上→E[adv] 常驻 +3（v8 实测
+    # adv_mean +2.49→+3.00）→ 81% 样本 A>0 → ratio clip 单侧饱和 → 梯度死 → 停滞
     entropy_coef: float = 0.003   # 前人 0.01；取更低值防 σ 膨胀（CPU 版教训）
     value_coef: float = 0.5
     target_kl: float = 0.01     # legged_gym 默认；epoch 早停兜底（actor-only）
@@ -146,7 +149,7 @@ def gaussian_log_prob(action, mu, std):
             - 0.5 * action_dim * jnp.log(2 * jnp.pi))
 
 
-def make_ppo_loss(clip_eps, entropy_coef, value_coef):
+def make_ppo_loss(clip_eps, entropy_coef, value_coef, value_clip_eps):
     """构造 PPO loss 闭包（超参固化，便于 JIT）
 
     教师为独立双网：params["actor"] 走 Actor(mu,std)，params["critic"] 走
@@ -164,7 +167,7 @@ def make_ppo_loss(clip_eps, entropy_coef, value_coef):
         surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
         policy_loss = -jnp.minimum(surr1, surr2).mean()
         value_pred_clipped = batch["old_value"] + \
-            jnp.clip(value - batch["old_value"], -clip_eps, clip_eps)
+            jnp.clip(value - batch["old_value"], -value_clip_eps, value_clip_eps)
         value_loss_unclipped = (value - batch["return_val"]) ** 2
         value_loss_clipped = (value_pred_clipped - batch["return_val"]) ** 2
         value_loss = 0.5 * jnp.maximum(value_loss_unclipped,
@@ -256,7 +259,7 @@ def make_update(env, config: PPOConfig, tx):
     """
     actor, critic = make_teacher_actor(), make_teacher_critic()
     ppo_loss = make_ppo_loss(config.clip_eps, config.entropy_coef,
-                             config.value_coef)
+                             config.value_coef, config.value_clip_eps)
     grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
     rollout_len = config.rollout_len
     batch_size = config.n_envs * config.rollout_len
