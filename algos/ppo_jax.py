@@ -53,7 +53,11 @@ from algos.networks_jax import make_teacher
 @dataclass(frozen=True)
 class PPOConfig:
     # 优化
-    lr: float = 3e-4
+    # lr 与 n_minibatches 联合决定每 epoch 的有效策略步长：
+    # Δμ/epoch ≈ lr × ||h||(512 维特征范数~16) × n_minibatches。
+    # 3e-4×32 时 epoch0 KL 实测 0.9-4.4（目标 0.02）；1e-4×8 预计 ~0.005。
+    # 2026-10-14 取证冒烟定案（kl_probe.log）。
+    lr: float = 1e-4
     anneal_steps: int = 20_000_000
     max_grad_norm: float = 1.0
     # PPO
@@ -67,7 +71,7 @@ class PPOConfig:
     n_envs: int = 2048
     rollout_len: int = 24
     n_epochs: int = 10
-    n_minibatches: int = 32
+    n_minibatches: int = 8
     total_steps: int = 20_000_000
     # 保存与日志
     save_interval: int = 50     # 每 N 个 update 存 checkpoint

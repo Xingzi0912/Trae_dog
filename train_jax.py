@@ -133,9 +133,9 @@ def main():
                         help="每个 env 每轮收集的步数")
     parser.add_argument("--n_epochs", type=int, default=10,
                         help="PPO 每 update 的 epoch 数")
-    parser.add_argument("--n_minibatches", type=int, default=32,
-                        help="每个 epoch 的 minibatch 数")
-    parser.add_argument("--lr", type=float, default=3e-4,
+    parser.add_argument("--n_minibatches", type=int, default=8,
+                        help="每个 epoch 的 minibatch 数（与 lr 联合决定有效步长）")
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="学习率")
     parser.add_argument("--distill_steps", type=int, default=None,
                         help="蒸馏总步数（默认=教师 1/4）")
