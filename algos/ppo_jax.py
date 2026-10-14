@@ -479,12 +479,15 @@ def train(rng, env, config: PPOConfig,
         if n_active < config.n_epochs:
             log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
 
-        # 自适应 lr（rsl_rl 标准机制）：按活跃 epoch 的 KL 均值调整。
-        # KL 爆 -> 减半；KL 远低于目标 -> 回升，让 lr 自动落在合适区间
+        # 自适应 lr：按活跃 epoch 的 KL 均值伺服，把 lr 稳定在"恰好用满
+        # KL 预算"的水平。注意回升条件是"未超标"而非 rsl_rl 的 "<target/2"：
+        # 实测存在与 lr 无关的 KL floor ~0.02（每 update 数据重采/advantage
+        # 归一化噪声），target/2=0.005 永不满足 → 单向棘轮跌穿地板
+        # （v3 实测 1e-4 连续减半至 1.56e-6 后策略冻结，reward 卡 0.38）
         kl_mean = float(m["kl"][:n_active].mean())
         if kl_mean > 2 * config.target_kl:
             lr_cur = max(config.lr_min, lr_cur * 0.5)
-        elif kl_mean < config.target_kl / 2:
+        else:
             lr_cur = min(config.lr_max, lr_cur * 1.25)
 
         metrics["update"].append(update)
