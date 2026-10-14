@@ -149,6 +149,12 @@ def main():
                              "DR 多样度。须整除 n_envs，否则回退 1（关 DR 时恒为 1）")
     parser.add_argument("--mem", type=float, default=None,
                         help="XLA 显存占比 0.0-1.0（覆盖环境变量）")
+    parser.add_argument("--resume", action="store_true",
+                        help="从 checkpoints/dog_cmd_mjx_teacher.pkl 续训"
+                             "（Adam 动量不保存，前 1-2 update 步长偏保守）")
+    parser.add_argument("--ent_coef", type=float, default=None,
+                        help="熵系数（默认用 PPOConfig 的 0.003；"
+                             "σ 噪声墙停滞时降为 0.001 加速 σ 收缩）")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -214,9 +220,22 @@ def main():
         path = CKPT_DIR / "dog_cmd_mjx_student.pkl"
         save_flax_checkpoint(ts, None, path)
 
+    # --- --resume：加载教师 checkpoint（params + obs_rms）---
+    init_params, init_obs_rms = None, None
+    if args.resume:
+        ckpt_path = CKPT_DIR / "dog_cmd_mjx_teacher.pkl"
+        with open(ckpt_path, "rb") as f:
+            ck = pickle.load(f)
+        init_params, init_obs_rms = ck["params"], ck["obs_rms"]
+        log(f"--resume：已加载 {ckpt_path}")
+
     # ========== 阶段 1：PPO 训教师 ==========
     log("\n--- 阶段 1：PPO 训教师 ---")
     save_interval = max(1, args.steps // (n_envs * rollout_len * 10))
+    cfg_kwargs = {}
+    if args.ent_coef is not None:
+        cfg_kwargs["entropy_coef"] = args.ent_coef
+        log(f"熵系数覆盖：{args.ent_coef}")
     ppo_cfg = PPOConfig(
         n_envs=n_envs,
         total_steps=args.steps,
@@ -226,11 +245,13 @@ def main():
         lr=args.lr,
         save_interval=save_interval,
         log_interval=1,
+        **cfg_kwargs,
     )
     log(f"PPO: save_interval={save_interval} updates, fixed lr={args.lr:.1e}")
     rng, train_rng = jax.random.split(rng)
     teacher_ts, obs_rms, teacher_metrics = train_teacher(
-        train_rng, env, ppo_cfg, log_fn=log, save_fn=teacher_save_fn)
+        train_rng, env, ppo_cfg, log_fn=log, save_fn=teacher_save_fn,
+        init_params=init_params, init_obs_rms=init_obs_rms)
     save_flax_checkpoint(teacher_ts, obs_rms,
                          CKPT_DIR / "dog_cmd_mjx_teacher.pkl")
 

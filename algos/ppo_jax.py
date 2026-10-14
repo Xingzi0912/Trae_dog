@@ -374,7 +374,9 @@ def make_update(env, config: PPOConfig, tx):
         (params, opt_state, _), m_ep = jax.lax.scan(
             epoch_fn, (params, opt_state, jnp.float32(1.0)), epoch_rngs)
 
-        metrics = {"reward": rew_arr.mean(), **m_ep}
+        # v7 停滞诊断：adv 共模偏置假说（ploss=-3 ↔ E[adv]>0）用实测裁决
+        metrics = {"reward": rew_arr.mean(), **m_ep,
+                   "adv_mean": adv.mean(), "adv_std": adv.std()}
         return (state, teacher_obs, rng, params, opt_state,
                 obs_mean, obs_var, obs_count), metrics
 
@@ -386,7 +388,8 @@ def make_update(env, config: PPOConfig, tx):
 # ---------------------------------------------------------------------------
 def train(rng, env, config: PPOConfig,
           log_fn: Callable[[str], None] = print,
-          save_fn: Callable | None = None):
+          save_fn: Callable | None = None,
+          init_params=None, init_obs_rms=None):
     """PPO 训练主循环（mega-jit 版）
 
     单 update = 一次 jit_update 调用（rollout+GAE+epochs 全在 GPU 完成）。
@@ -399,6 +402,10 @@ def train(rng, env, config: PPOConfig,
         config: PPOConfig
         log_fn: 日志回调（默认 print）
         save_fn: 可选 checkpoint 回调 (ts, obs_rms, update) -> None
+        init_params: 可选已训练参数 dict（--resume 续训，据此重建 TrainState；
+                 Adam 动量不保存在 checkpoint，从零重热，前 1-2 update
+                 步长偏保守属正常）
+        init_obs_rms: 与 init_params 配套的已收敛 obs_rms
     返回: (ts, obs_rms, metrics)
     """
     # adam 用 lr=1.0，真实 lr 在 jit_update 内由 lr_t 缩放（数学上等价，
@@ -407,9 +414,20 @@ def train(rng, env, config: PPOConfig,
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adam(1.0),
     )
-    rng, init_rng = jax.random.split(rng)
-    ts = create_train_state(init_rng, tx)
-    obs_rms = RunningMeanStd.create((99,))
+    if init_params is not None:
+        actor = make_teacher_actor()
+        ts = TrainState.create(apply_fn=actor.apply, params=init_params, tx=tx)
+        # 与 create_train_state 同样的强类型处理（weak_type 变化会改 jit 缓存键
+        # → mega-jit 多编译一次，见 create_train_state docstring）
+        ts = ts.replace(
+            params=jax.tree_util.tree_map(_to_strong, ts.params),
+            opt_state=jax.tree_util.tree_map(_to_strong, ts.opt_state))
+        obs_rms = init_obs_rms
+        log_fn("  --resume：已从 checkpoint 恢复 params + obs_rms")
+    else:
+        rng, init_rng = jax.random.split(rng)
+        ts = create_train_state(init_rng, tx)
+        obs_rms = RunningMeanStd.create((99,))
 
     actor_forward = jax.jit(
         lambda params, obs: make_teacher_actor().apply(params["actor"], obs))
@@ -427,7 +445,8 @@ def train(rng, env, config: PPOConfig,
            f"mb_size={batch_size // config.n_minibatches}")
 
     metrics = {"update": [], "reward": [], "entropy": [], "kl": [],
-               "value_loss": [], "policy_loss": []}
+               "value_loss": [], "policy_loss": [],
+               "adv_mean": [], "adv_std": []}
 
     # --- obs_rms warmup（避免第一次 rollout 用 mean=0/var=1 等于没归一化）---
     # teacher_obs 含 IMU(~10) / 关节角(~1) / 特权信息，尺度差异大；
@@ -496,12 +515,15 @@ def train(rng, env, config: PPOConfig,
         metrics["kl"].append(kl)
         metrics["value_loss"].append(vloss)
         metrics["policy_loss"].append(ploss)
+        metrics["adv_mean"].append(float(m["adv_mean"]))
+        metrics["adv_std"].append(float(m["adv_std"]))
 
         if update % config.log_interval == 0:
             log_fn(f"  update {update}/{n_updates}, "
                    f"reward={float(m['reward']):.3f}, "
                    f"entropy={ent:.3f}, kl={kl:.4f}, "
                    f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
+                   f"adv={float(m['adv_mean']):+.3f}±{float(m['adv_std']):.3f}, "
                    f"lr={lr_cur:.2e}, dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
