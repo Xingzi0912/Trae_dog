@@ -468,6 +468,7 @@ def train(rng, env, config: PPOConfig,
             log_fn(f"  update {update}/{n_updates}, "
                    f"reward={float(m['reward']):.3f}, "
                    f"entropy={ent:.3f}, kl={kl:.4f}, "
+                   f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
                    f"lr={float(lr_t):.2e}, dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
