@@ -155,6 +155,10 @@ def main():
     parser.add_argument("--ent_coef", type=float, default=None,
                         help="熵系数（默认用 PPOConfig 的 0.003；"
                              "σ 噪声墙停滞时降为 0.001 加速 σ 收缩）")
+    parser.add_argument("--target_kl", type=float, default=None,
+                        help="epoch 级 KL 早停阈值（默认 PPOConfig 的 0.01；"
+                             "v10 判决：actor 复活后 0.01 每 update 必触发掐掉"
+                             " 60-80%% 学习步，改 0.1 与 per-mb 闸同哲学）")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -236,6 +240,9 @@ def main():
     if args.ent_coef is not None:
         cfg_kwargs["entropy_coef"] = args.ent_coef
         log(f"熵系数覆盖：{args.ent_coef}")
+    if args.target_kl is not None:
+        cfg_kwargs["target_kl"] = args.target_kl
+        log(f"epoch KL 早停阈值覆盖：{args.target_kl}")
     ppo_cfg = PPOConfig(
         n_envs=n_envs,
         total_steps=args.steps,
