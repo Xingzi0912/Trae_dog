@@ -68,7 +68,9 @@ class PPOConfig:
     entropy_coef: float = 0.003   # 前人 0.01；取更低值防 σ 膨胀（CPU 版教训）
     value_coef: float = 0.5
     target_kl: float = 0.01     # legged_gym 默认；epoch 早停兜底（actor-only）
-    target_kl_mb: float = 0.05  # 单 mb 步 KL 上限：epoch 内每步检查，超即冻结
+    target_kl_mb: float = 0.1   # 单 mb 步 KL 上限：epoch 内每步检查，超即冻结
+    # （0.05 实测把正常学习步也拦掉→reward 平台；0.1=防灾难不防学习，
+    # 单步 ratio 上限 e^1.5≈4.5，ploss 尖峰 <1）
     # actor 剩余步（2026-10-14 v5 实测：epoch 内 4 步无约束，加速期单 mb
     # ratio 爆到 e^9（ploss=7598），epoch 级止损太粗兜不住）
     # 训练
@@ -324,8 +326,10 @@ def make_update(env, config: PPOConfig, tx):
             "return_val": ret.reshape(batch_size),
             "old_value": val_arr.reshape(batch_size),
         }
-        a = batch["advantage"]
-        batch["advantage"] = (a - a.mean()) / (a.std() + 1e-8)
+        # advantage 不做归一化（2026-10-14 对齐 rsl_rl/legged_gym 事实标准）：
+        # 归一化在 Adam 下把 value 残差噪声样本（|A| 重尾）与真信号强制等权，
+        # 污染梯度方向 → 策略乱漂 → v1/v1.5/v5 三次自激的共同土壤。
+        # 保留原始 adv 尺度，让一致的真信号主导方向。
 
         def epoch_fn(carry, epoch_rng):
             params, opt_state, active = carry
