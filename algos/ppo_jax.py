@@ -52,12 +52,11 @@ from algos.networks_jax import make_teacher_actor, make_teacher_critic
 @dataclass(frozen=True)
 class PPOConfig:
     # 优化 —— 2026-10-14 对齐 rsl_rl/legged_gym 成熟配置（Go1/Go2/ANYmal 事实标准）
-    # 自适应 lr 取代固定 lr+线性退火：KL>2*target → lr*0.5；KL<target/2 → lr*1.25。
-    # 依据：固定 lr 下 epoch0 内 8 mb 步累积 KL 0.1-0.3，12 update 自激爆到 5.7
-    # （ploss 72，策略跑飞）。adaptive lr 是 rsl_rl 的标准 KL 控制机制。
-    lr: float = 1e-4            # adaptive 起点（1e-3 起点实测首 update KL 2.5，
-                                # 把 residual 好起点推坏且被 KL 棘轮冻死；512 宽
-                                # 网络特征 L1 范数~200 放大有效步长，取 1e-4）
+    # 固定 lr（v4 实测定标）：1e-4×80步/update 12 update 自激；~5e-6 被 KL
+    # floor 冻死；adaptive lr 因 KL 对 lr 噪声主导（单样本 kl_mean 驱动乘性
+    # 调整，减半/回升增益不对称）退化为几何随机游走净向下，弃用。
+    # 5e-5 = 平衡点，每 update μ 漂移~0.04/dim，epoch 早停兜底单 update 爆炸。
+    lr: float = 5e-5
     lr_min: float = 1e-6
     lr_max: float = 1e-2
     anneal_steps: int = 0       # 已弃用（保留字段兼容旧 checkpoint 脚本）
@@ -448,7 +447,7 @@ def train(rng, env, config: PPOConfig,
     log_fn("  jit_update 编译中（一次性，会较慢）...")
 
     params, opt_state = ts.params, ts.opt_state
-    lr_cur = float(config.lr)   # 自适应 lr 的当前值（host 侧，每 update 调整）
+    lr_cur = float(config.lr)   # 固定 lr（adaptive 因 KL 噪声主导弃用，见 PPOConfig）
     for update in range(n_updates):
         t0 = time.time()
         # 每个 update 重采样 K 份模型级 DR（跨 update 覆盖 DR 分布；
@@ -479,16 +478,7 @@ def train(rng, env, config: PPOConfig,
         if n_active < config.n_epochs:
             log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
 
-        # 自适应 lr：按活跃 epoch 的 KL 均值伺服，把 lr 稳定在"恰好用满
-        # KL 预算"的水平。注意回升条件是"未超标"而非 rsl_rl 的 "<target/2"：
-        # 实测存在与 lr 无关的 KL floor ~0.02（每 update 数据重采/advantage
-        # 归一化噪声），target/2=0.005 永不满足 → 单向棘轮跌穿地板
-        # （v3 实测 1e-4 连续减半至 1.56e-6 后策略冻结，reward 卡 0.38）
-        kl_mean = float(m["kl"][:n_active].mean())
-        if kl_mean > 2 * config.target_kl:
-            lr_cur = max(config.lr_min, lr_cur * 0.5)
-        else:
-            lr_cur = min(config.lr_max, lr_cur * 1.25)
+        # KL 监控（仅记录，不再驱动 lr 调整；epoch 早停兜底单 update 爆炸）
 
         metrics["update"].append(update)
         metrics["reward"].append(float(m["reward"]))

@@ -135,8 +135,8 @@ def main():
                         help="PPO 每 update 的 epoch 数（legged_gym 默认 5）")
     parser.add_argument("--n_minibatches", type=int, default=4,
                         help="每个 epoch 的 minibatch 数（legged_gym 默认 4）")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="自适应 lr 起点（KL>2x target 减半，<target/2 回升）")
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="固定学习率（KL 由 epoch 早停兜底控制）")
     parser.add_argument("--distill_steps", type=int, default=None,
                         help="蒸馏总步数（默认=教师 1/4）")
     parser.add_argument("--no_residual", action="store_true",
@@ -227,8 +227,7 @@ def main():
         save_interval=save_interval,
         log_interval=1,
     )
-    log(f"PPO: save_interval={save_interval} updates, "
-        f"adaptive lr from {args.lr:.1e}")
+    log(f"PPO: save_interval={save_interval} updates, fixed lr={args.lr:.1e}")
     rng, train_rng = jax.random.split(rng)
     teacher_ts, obs_rms, teacher_metrics = train_teacher(
         train_rng, env, ppo_cfg, log_fn=log, save_fn=teacher_save_fn)
