@@ -3,13 +3,13 @@
 教师网络输入 99 维 = 61 标准观测 + 38 特权信息。
 学生蒸馏见 distill_jax.py。
 
-PPO 配方（沿用旧 PyTorch 版验证过的超参，决策 6）：
+PPO 配方（2026-10-14 对齐 rsl_rl/legged_gym 成熟配置，Go1/Go2/ANYmal 事实标准）：
     - GAE (gamma=0.99, lambda=0.95)
     - clip ratio 0.2，value clip 0.2
-    - 熵系数 0.003（防止 σ 膨胀）
-    - KL 早停 0.02（防止策略灾难性跳跃）
+    - 熵系数 0.003（比前人 0.01 更保守，防 σ 膨胀）
+    - KL 早停 0.01（epoch 级，actor-only 兜底）
+    - 自适应 lr（起点 1e-3，KL>2*target 减半 / <target/2 回升，替代线性退火）
     - value loss coef 0.5
-    - lr 线性衰减（anneal_steps 独立于 total_steps）
     - obs_rms 在线归一化（IMU 量级 ~10 vs 关节角 ~1）
 
 关键修复（2026-10-12）：
@@ -29,8 +29,7 @@ PPO 配方（沿用旧 PyTorch 版验证过的超参，决策 6）：
     相同），且每 minibatch float(kl) 造成 host-device 同步。现把
     rollout + GAE + n_epochs×n_minibatches 包进单个 jit（Brax 风格），
     整个训练只编译一次；KL 早停改为 epoch mask（超阈值后 lr 置零，参数
-    冻结，语义与 Python break 等价）；LR 线性衰减正式接线（旧版
-    anneal_steps 传了但从未生效）。
+    冻结，语义与 Python break 等价）。2026-10-14 起改用 host 侧自适应 lr。
 """
 
 from __future__ import annotations
@@ -52,26 +51,27 @@ from algos.networks_jax import make_teacher_actor, make_teacher_critic
 
 @dataclass(frozen=True)
 class PPOConfig:
-    # 优化
-    # lr 与 n_minibatches 联合决定每 epoch 的有效策略步长：
-    # Δμ/epoch ≈ lr × ||h||(512 维特征范数~16) × n_minibatches。
-    # 3e-4×32 时 epoch0 KL 实测 0.9-4.4（目标 0.02）；1e-4×8 预计 ~0.005。
-    # 2026-10-14 取证冒烟定案（kl_probe.log）。
-    lr: float = 1e-4
-    anneal_steps: int = 20_000_000
+    # 优化 —— 2026-10-14 对齐 rsl_rl/legged_gym 成熟配置（Go1/Go2/ANYmal 事实标准）
+    # 自适应 lr 取代固定 lr+线性退火：KL>2*target → lr*0.5；KL<target/2 → lr*1.25。
+    # 依据：固定 lr 下 epoch0 内 8 mb 步累积 KL 0.1-0.3，12 update 自激爆到 5.7
+    # （ploss 72，策略跑飞）。adaptive lr 是 rsl_rl 的标准 KL 控制机制。
+    lr: float = 1e-3            # adaptive 起点（legged_gym 默认）
+    lr_min: float = 1e-6
+    lr_max: float = 1e-2
+    anneal_steps: int = 0       # 已弃用（保留字段兼容旧 checkpoint 脚本）
     max_grad_norm: float = 1.0
     # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    entropy_coef: float = 0.003
+    entropy_coef: float = 0.003   # 前人 0.01；取更低值防 σ 膨胀（CPU 版教训）
     value_coef: float = 0.5
-    target_kl: float = 0.02
+    target_kl: float = 0.01     # legged_gym 默认；epoch 早停兜底（actor-only）
     # 训练
     n_envs: int = 2048
     rollout_len: int = 24
-    n_epochs: int = 10
-    n_minibatches: int = 8
+    n_epochs: int = 5           # legged_gym 默认
+    n_minibatches: int = 4      # legged_gym 默认
     total_steps: int = 20_000_000
     # 保存与日志
     save_interval: int = 50     # 每 N 个 update 存 checkpoint
@@ -379,8 +379,8 @@ def train(rng, env, config: PPOConfig,
     """PPO 训练主循环（mega-jit 版）
 
     单 update = 一次 jit_update 调用（rollout+GAE+epochs 全在 GPU 完成）。
-    LR 线性衰减：lr_t = lr × (1 − steps_done/anneal_steps)，按 update 递减。
-    （旧版 anneal_steps 传了但从未接线，2026-10-13 修复。）
+    自适应 lr（rsl_rl 标准）：每 update 按活跃 epoch 的 KL 均值调整，
+    KL>2*target 减半、KL<target/2 回升 1.25 倍，替代旧线性退火。
 
     Args:
         rng: JAX 随机键
@@ -446,6 +446,7 @@ def train(rng, env, config: PPOConfig,
     log_fn("  jit_update 编译中（一次性，会较慢）...")
 
     params, opt_state = ts.params, ts.opt_state
+    lr_cur = float(config.lr)   # 自适应 lr 的当前值（host 侧，每 update 调整）
     for update in range(n_updates):
         t0 = time.time()
         # 每个 update 重采样 K 份模型级 DR（跨 update 覆盖 DR 分布；
@@ -453,9 +454,7 @@ def train(rng, env, config: PPOConfig,
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)
 
-        lr_t = jnp.float32(
-            config.lr * max(0.0, 1.0 - update * batch_size
-                            / config.anneal_steps))
+        lr_t = jnp.float32(lr_cur)
         carry_out, m = jit_update(
             state, teacher_obs, rng, params, opt_state,
             obs_rms.mean, obs_rms.var, obs_rms.count, lr_t, dr_model)
@@ -478,6 +477,14 @@ def train(rng, env, config: PPOConfig,
         if n_active < config.n_epochs:
             log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
 
+        # 自适应 lr（rsl_rl 标准机制）：按活跃 epoch 的 KL 均值调整。
+        # KL 爆 -> 减半；KL 远低于目标 -> 回升，让 lr 自动落在合适区间
+        kl_mean = float(m["kl"][:n_active].mean())
+        if kl_mean > 2 * config.target_kl:
+            lr_cur = max(config.lr_min, lr_cur * 0.5)
+        elif kl_mean < config.target_kl / 2:
+            lr_cur = min(config.lr_max, lr_cur * 1.25)
+
         metrics["update"].append(update)
         metrics["reward"].append(float(m["reward"]))
         metrics["entropy"].append(ent)
@@ -490,7 +497,7 @@ def train(rng, env, config: PPOConfig,
                    f"reward={float(m['reward']):.3f}, "
                    f"entropy={ent:.3f}, kl={kl:.4f}, "
                    f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
-                   f"lr={float(lr_t):.2e}, dt={dt:.1f}s, sps={sps:.0f}")
+                   f"lr={lr_cur:.2e}, dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
             save_fn(ts, obs_rms, update)

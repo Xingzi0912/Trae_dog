@@ -131,12 +131,12 @@ def main():
                         help="并行环境数（默认：GPU=2048, CPU=16）")
     parser.add_argument("--rollout_len", type=int, default=24,
                         help="每个 env 每轮收集的步数")
-    parser.add_argument("--n_epochs", type=int, default=10,
-                        help="PPO 每 update 的 epoch 数")
-    parser.add_argument("--n_minibatches", type=int, default=8,
-                        help="每个 epoch 的 minibatch 数（与 lr 联合决定有效步长）")
-    parser.add_argument("--lr", type=float, default=1e-4,
-                        help="学习率")
+    parser.add_argument("--n_epochs", type=int, default=5,
+                        help="PPO 每 update 的 epoch 数（legged_gym 默认 5）")
+    parser.add_argument("--n_minibatches", type=int, default=4,
+                        help="每个 epoch 的 minibatch 数（legged_gym 默认 4）")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="自适应 lr 起点（KL>2x target 减半，<target/2 回升）")
     parser.add_argument("--distill_steps", type=int, default=None,
                         help="蒸馏总步数（默认=教师 1/4）")
     parser.add_argument("--no_residual", action="store_true",
@@ -224,11 +224,11 @@ def main():
         n_epochs=n_epochs,
         n_minibatches=n_minibatches,
         lr=args.lr,
-        anneal_steps=args.steps,
         save_interval=save_interval,
         log_interval=1,
     )
-    log(f"PPO: save_interval={save_interval} updates")
+    log(f"PPO: save_interval={save_interval} updates, "
+        f"adaptive lr from {args.lr:.1e}")
     rng, train_rng = jax.random.split(rng)
     teacher_ts, obs_rms, teacher_metrics = train_teacher(
         train_rng, env, ppo_cfg, log_fn=log, save_fn=teacher_save_fn)
