@@ -156,9 +156,12 @@ def main():
                         help="熵系数（默认用 PPOConfig 的 0.003；"
                              "σ 噪声墙停滞时降为 0.001 加速 σ 收缩）")
     parser.add_argument("--target_kl", type=float, default=None,
-                        help="epoch 级 KL 早停阈值（默认 PPOConfig 的 0.01；"
-                             "v10 判决：actor 复活后 0.01 每 update 必触发掐掉"
-                             " 60-80%% 学习步，改 0.1 与 per-mb 闸同哲学）")
+                        help="【已失效】mega-jit 路径不读取 config.target_kl，"
+                             "仅 target_kl_mb 生效；保留仅为兼容旧命令")
+    parser.add_argument("--target_kl_mb", type=float, default=None,
+                        help="per-mb 累积 KL 冻结阈值（默认 PPOConfig 的 0.1；"
+                             "v12 判决：actor 每 update 烧满 0.1 预算即被冻结"
+                             "（16/16 update 触发、11/16 在 epoch 0），放宽至 0.2）")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -241,8 +244,10 @@ def main():
         cfg_kwargs["entropy_coef"] = args.ent_coef
         log(f"熵系数覆盖：{args.ent_coef}")
     if args.target_kl is not None:
-        cfg_kwargs["target_kl"] = args.target_kl
-        log(f"epoch KL 早停阈值覆盖：{args.target_kl}")
+        log(f"⚠️ --target_kl 已失效（epoch 闸在 mega-jit 路径中不存在），忽略")
+    if args.target_kl_mb is not None:
+        cfg_kwargs["target_kl_mb"] = args.target_kl_mb
+        log(f"per-mb 累积 KL 冻结阈值覆盖：{args.target_kl_mb}")
     ppo_cfg = PPOConfig(
         n_envs=n_envs,
         total_steps=args.steps,
