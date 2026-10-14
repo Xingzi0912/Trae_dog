@@ -68,6 +68,9 @@ class PPOConfig:
     entropy_coef: float = 0.003   # 前人 0.01；取更低值防 σ 膨胀（CPU 版教训）
     value_coef: float = 0.5
     target_kl: float = 0.01     # legged_gym 默认；epoch 早停兜底（actor-only）
+    target_kl_mb: float = 0.05  # 单 mb 步 KL 上限：epoch 内每步检查，超即冻结
+    # actor 剩余步（2026-10-14 v5 实测：epoch 内 4 步无约束，加速期单 mb
+    # ratio 爆到 e^9（ploss=7598），epoch 级止损太粗兜不住）
     # 训练
     n_envs: int = 2048
     rollout_len: int = 24
@@ -257,7 +260,7 @@ def make_update(env, config: PPOConfig, tx):
     batch_size = config.n_envs * config.rollout_len
     n_mb = config.n_minibatches
     mb_size = batch_size // n_mb
-    target_kl = config.target_kl
+    mb_kl_limit = config.target_kl_mb   # 单 mb 步 KL 上限（per-mb 早停阈值）
 
     @jax.jit
     def jit_update(state, teacher_obs, rng, params, opt_state,
@@ -327,32 +330,35 @@ def make_update(env, config: PPOConfig, tx):
         def epoch_fn(carry, epoch_rng):
             params, opt_state, active = carry
             a_in = active
-            lr_eff = lr_t  # critic 恒定学习率（不随 KL mask 冻结）
-            lr_actor = lr_t * active  # KL mask：active=0 时仅 actor 冻结
             perm = jax.random.permutation(epoch_rng, batch_size)
             mbs = jax.tree_util.tree_map(
                 lambda x: x[perm].reshape(n_mb, mb_size, *x.shape[1:]),
                 batch)
 
             def mb_fn(c, mb):
-                p, os_ = c
+                # act：actor 活跃标志（mb 级传播）。初值 = epoch 级 active
+                #（已被 epoch 早停折叠），本步 KL 超 mb_kl_limit 后置 0，
+                # 冻结 actor 剩余所有步（critic 照常）。
+                p, os_, act = c
                 (_, info), grads = grad_fn(p, mb)
                 upd, os_ = tx.update(grads, os_, p)
                 # tx 内 adam lr=1.0，在此按 lr 缩放：KL mask 只作用于
                 # actor 子树，critic 全程学习（2026-10-14 vloss 修复核心）
                 upd = {
                     "actor": jax.tree_util.tree_map(
-                        lambda u: u * lr_actor, upd["actor"]),
+                        lambda u: u * (lr_t * act), upd["actor"]),
                     "critic": jax.tree_util.tree_map(
-                        lambda u: u * lr_eff, upd["critic"]),
+                        lambda u: u * lr_t, upd["critic"]),
                 }
                 p = optax.apply_updates(p, upd)
-                return (p, os_), info
+                act = act * jnp.where(
+                    info["kl"] <= mb_kl_limit, 1.0, 0.0)
+                return (p, os_, act), info
 
-            (params, opt_state), infos = jax.lax.scan(
-                mb_fn, (params, opt_state), mbs)
+            (params, opt_state, act_final), infos = jax.lax.scan(
+                mb_fn, (params, opt_state, active), mbs)
             kl_e = infos["kl"].mean()
-            active = active * (kl_e <= target_kl).astype(jnp.float32)
+            active = act_final  # mb 级 act 跨 epoch 传播（epoch 早停并入其中）
             m_out = {"kl": kl_e, "entropy": infos["entropy"].mean(),
                      "value_loss": infos["value_loss"].mean(),
                      "policy_loss": infos["policy_loss"].mean(),
