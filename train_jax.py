@@ -135,7 +135,7 @@ def main():
                         help="PPO 每 update 的 epoch 数（legged_gym 默认 5）")
     parser.add_argument("--n_minibatches", type=int, default=4,
                         help="每个 epoch 的 minibatch 数（legged_gym 默认 4）")
-    parser.add_argument("--lr", type=float, default=1e-3,
+    parser.add_argument("--lr", type=float, default=1e-4,
                         help="自适应 lr 起点（KL>2x target 减半，<target/2 回升）")
     parser.add_argument("--distill_steps", type=int, default=None,
                         help="蒸馏总步数（默认=教师 1/4）")

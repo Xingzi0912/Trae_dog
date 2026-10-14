@@ -55,7 +55,9 @@ class PPOConfig:
     # 自适应 lr 取代固定 lr+线性退火：KL>2*target → lr*0.5；KL<target/2 → lr*1.25。
     # 依据：固定 lr 下 epoch0 内 8 mb 步累积 KL 0.1-0.3，12 update 自激爆到 5.7
     # （ploss 72，策略跑飞）。adaptive lr 是 rsl_rl 的标准 KL 控制机制。
-    lr: float = 1e-3            # adaptive 起点（legged_gym 默认）
+    lr: float = 1e-4            # adaptive 起点（1e-3 起点实测首 update KL 2.5，
+                                # 把 residual 好起点推坏且被 KL 棘轮冻死；512 宽
+                                # 网络特征 L1 范数~200 放大有效步长，取 1e-4）
     lr_min: float = 1e-6
     lr_max: float = 1e-2
     anneal_steps: int = 0       # 已弃用（保留字段兼容旧 checkpoint 脚本）
