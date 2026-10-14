@@ -24,8 +24,13 @@ import numpy as np
 import flax.linen as nn
 
 
-class ActorCritic(nn.Module):
-    """对角高斯 Actor + V Critic，共享结构（教师/学生通用）"""
+class Actor(nn.Module):
+    """对角高斯策略网络（独立参数，PPO 教师用）
+
+    2026-10-14 从 ActorCritic 拆出：KL 早停只 mask actor 梯度、critic 全速
+    学习（value 拟合不受策略 KL 约束），需要 params 树按 {"actor","critic"}
+    分子树才能在 jit 内逐子树 mask。
+    """
     obs_dim: int
     action_dim: int
     hidden: int = 512
@@ -33,7 +38,6 @@ class ActorCritic(nn.Module):
 
     @nn.compact
     def __call__(self, obs):
-        # Actor trunk
         a = nn.Dense(self.hidden)(obs)
         a = nn.relu(a)
         a = nn.Dense(self.hidden)(a)
@@ -53,6 +57,46 @@ class ActorCritic(nn.Module):
                 np.full(shape, self.init_log_std, dtype=np.float32)),
             (self.action_dim,))
         std = jnp.exp(log_std)
+        return mu, std
+
+
+class Critic(nn.Module):
+    """价值网络（独立参数，与 Actor 完全隔离）"""
+    obs_dim: int
+    hidden: int = 512
+
+    @nn.compact
+    def __call__(self, obs):
+        v = nn.Dense(self.hidden)(obs)
+        v = nn.relu(v)
+        v = nn.Dense(self.hidden)(v)
+        v = nn.relu(v)
+        return nn.Dense(1)(v).squeeze(-1)   # (batch,)
+
+
+class ActorCritic(nn.Module):
+    """对角高斯 Actor + V Critic（单 Module 双独立 trunk，学生/蒸馏用）"""
+    obs_dim: int
+    action_dim: int
+    hidden: int = 512
+    init_log_std: float = -0.5
+
+    @nn.compact
+    def __call__(self, obs):
+        # Actor trunk
+        a = nn.Dense(self.hidden)(obs)
+        a = nn.relu(a)
+        a = nn.Dense(self.hidden)(a)
+        a = nn.relu(a)
+        mu = nn.Dense(self.action_dim)(a)
+
+        # 全局 log_std（状态无关，强类型初始化原因见 Actor）
+        log_std = self.param(
+            "log_std",
+            lambda rng, shape: jnp.array(
+                np.full(shape, self.init_log_std, dtype=np.float32)),
+            (self.action_dim,))
+        std = jnp.exp(log_std)
 
         # Critic trunk（独立）
         v = nn.Dense(self.hidden)(obs)
@@ -64,8 +108,18 @@ class ActorCritic(nn.Module):
         return mu, std, value
 
 
+def make_teacher_actor(action_dim: int = 12) -> Actor:
+    """教师 Actor：99 维输入（61 标准 + 38 特权）"""
+    return Actor(obs_dim=99, action_dim=action_dim)
+
+
+def make_teacher_critic() -> Critic:
+    """教师 Critic：99 维输入"""
+    return Critic(obs_dim=99)
+
+
 def make_teacher(action_dim: int = 12) -> ActorCritic:
-    """教师网络：99 维输入（61 标准 + 38 特权）"""
+    """教师合一网络（旧接口；smoke 脚本用。正式 PPO 走 make_teacher_actor/critic）"""
     return ActorCritic(obs_dim=99, action_dim=action_dim)
 
 

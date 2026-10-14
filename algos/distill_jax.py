@@ -33,7 +33,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from envs.dog_env_mjx import DogEnvMJX, EnvConfig, tree_where_done
-from algos.networks_jax import make_teacher, make_student
+from algos.networks_jax import make_teacher_actor, make_teacher_critic, make_student
 
 
 @dataclass(frozen=True)
@@ -122,7 +122,9 @@ def train_student(rng, teacher_ts, env, config: DistillConfig,
     distill_loss = make_distill_loss(config.alpha, config.beta)
     distill_grad = jax.jit(jax.value_and_grad(distill_loss, has_aux=True))
     teacher_forward = jax.jit(
-        lambda params, obs: make_teacher().apply(params, obs))
+        lambda params, obs: (
+            *make_teacher_actor().apply(params["actor"], obs),
+            make_teacher_critic().apply(params["critic"], obs)))
     student_forward = jax.jit(
         lambda params, obs: make_student().apply(params, obs))
 

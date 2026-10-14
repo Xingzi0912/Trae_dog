@@ -47,7 +47,7 @@ import optax
 from flax.training.train_state import TrainState
 
 from envs.dog_env_mjx import DogEnvMJX, EnvConfig, tree_where_done
-from algos.networks_jax import make_teacher
+from algos.networks_jax import make_teacher_actor, make_teacher_critic
 
 
 @dataclass(frozen=True)
@@ -141,10 +141,16 @@ def gaussian_log_prob(action, mu, std):
 
 
 def make_ppo_loss(clip_eps, entropy_coef, value_coef):
-    """构造 PPO loss 闭包（超参固化，便于 JIT）"""
+    """构造 PPO loss 闭包（超参固化，便于 JIT）
+
+    教师为独立双网：params["actor"] 走 Actor(mu,std)，params["critic"] 走
+    Critic(value)。两子树参数完全隔离。
+    """
+    actor, critic = make_teacher_actor(), make_teacher_critic()
+
     def ppo_loss(params, batch):
-        model = make_teacher()
-        mu, std, value = model.apply(params, batch["obs"])
+        mu, std = actor.apply(params["actor"], batch["obs"])
+        value = critic.apply(params["critic"], batch["obs"])
         log_prob = gaussian_log_prob(batch["action"], mu, std)
         ratio = jnp.exp(log_prob - batch["old_log_prob"])
         adv = batch["advantage"]
@@ -204,11 +210,13 @@ def _to_strong(x):
 
 
 def create_train_state(rng, tx):
-    model = make_teacher()
+    actor, critic = make_teacher_actor(), make_teacher_critic()
     # dummy 也要强类型：jnp.zeros 是弱类型，而 Flax 以输入 dtype 决定参数 dtype
     dummy = jnp.array(np.zeros((1, 99), dtype=np.float32))
-    params = model.init(rng, dummy)
-    ts = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    rng, rng_c = jax.random.split(rng)
+    params = {"actor": actor.init(rng, dummy),
+              "critic": critic.init(rng_c, dummy)}
+    ts = TrainState.create(apply_fn=actor.apply, params=params, tx=tx)
     return ts.replace(
         params=jax.tree_util.tree_map(_to_strong, ts.params),
         opt_state=jax.tree_util.tree_map(_to_strong, ts.opt_state))
@@ -223,7 +231,8 @@ def make_update(env, config: PPOConfig, tx):
     - 消除 Python 循环的全部 host-device 同步（旧版每 minibatch
       float(kl) 同步一次，32 次/update）
     - KL 早停 = epoch mask：某 epoch 平均 KL 超 target_kl 后，后续 epoch
-      lr 置零、参数冻结（该 epoch 本身完整应用，与旧版 Python break 等价）
+      **仅 actor** 冻结（梯度置 0）；critic 在全部 epoch 继续更新——
+      value 拟合不受策略 KL 约束（2026-10-14，修复 vloss 横在 O(10) 的根因）
 
     jit_update 参数（签名跨 update 完全稳定，不会重编译）：
         state, teacher_obs, rng, params, opt_state,
@@ -239,7 +248,7 @@ def make_update(env, config: PPOConfig, tx):
                  为 (n_epochs,) 逐 epoch 数组。active[e]=1 表示 epoch e
                  实际参与了更新（0 = 已被 KL mask 冻结）。
     """
-    model = make_teacher()
+    actor, critic = make_teacher_actor(), make_teacher_critic()
     ppo_loss = make_ppo_loss(config.clip_eps, config.entropy_coef,
                              config.value_coef)
     grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
@@ -261,7 +270,8 @@ def make_update(env, config: PPOConfig, tx):
             st, tobs, k = carry
             # normalize（rollout 期间固定，结束后才更新）
             tobs_n = (tobs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-            mu, std, value = model.apply(params, tobs_n)
+            mu, std = actor.apply(params["actor"], tobs_n)
+            value = critic.apply(params["critic"], tobs_n)
             # 先 clip 再算 log_prob（与 ppo_loss 一致）
             k, k_act, k_reset = jax.random.split(k, 3)
             action = mu + std * jax.random.normal(k_act, mu.shape)
@@ -285,7 +295,7 @@ def make_update(env, config: PPOConfig, tx):
 
         # ---------- 2. GAE ----------
         tobs_last_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-        _, _, last_value = model.apply(params, tobs_last_n)
+        last_value = critic.apply(params["critic"], tobs_last_n)
         adv, ret = compute_gae(rew_arr, val_arr, done_arr, last_value,
                                config.gamma, config.gae_lambda)
 
@@ -316,7 +326,8 @@ def make_update(env, config: PPOConfig, tx):
         def epoch_fn(carry, epoch_rng):
             params, opt_state, active = carry
             a_in = active
-            lr_eff = lr_t * active   # KL mask：active=0 时本 epoch 参数冻结
+            lr_eff = lr_t  # critic 恒定学习率（不随 KL mask 冻结）
+            lr_actor = lr_t * active  # KL mask：active=0 时仅 actor 冻结
             perm = jax.random.permutation(epoch_rng, batch_size)
             mbs = jax.tree_util.tree_map(
                 lambda x: x[perm].reshape(n_mb, mb_size, *x.shape[1:]),
@@ -326,8 +337,14 @@ def make_update(env, config: PPOConfig, tx):
                 p, os_ = c
                 (_, info), grads = grad_fn(p, mb)
                 upd, os_ = tx.update(grads, os_, p)
-                # tx 内 adam lr=1.0，在此按 lr_t 缩放（支持 lr 衰减+KL mask）
-                upd = jax.tree_util.tree_map(lambda u: u * lr_eff, upd)
+                # tx 内 adam lr=1.0，在此按 lr 缩放：KL mask 只作用于
+                # actor 子树，critic 全程学习（2026-10-14 vloss 修复核心）
+                upd = {
+                    "actor": jax.tree_util.tree_map(
+                        lambda u: u * lr_actor, upd["actor"]),
+                    "critic": jax.tree_util.tree_map(
+                        lambda u: u * lr_eff, upd["critic"]),
+                }
                 p = optax.apply_updates(p, upd)
                 return (p, os_), info
 
@@ -384,7 +401,7 @@ def train(rng, env, config: PPOConfig,
     obs_rms = RunningMeanStd.create((99,))
 
     actor_forward = jax.jit(
-        lambda params, obs: make_teacher().apply(params, obs))
+        lambda params, obs: make_teacher_actor().apply(params["actor"], obs))
 
     # reset（先采样本 rollout 的 K 份模型级 DR；K=1 即整批 env 共享一份）
     rng, reset_rng, k_dr = jax.random.split(rng, 3)
@@ -408,7 +425,7 @@ def train(rng, env, config: PPOConfig,
     mx_model = env.build_model(dr_model)
     for _ in range(config.rollout_len):
         teacher_obs_norm = obs_rms.normalize(teacher_obs)
-        mu, std, _ = actor_forward(ts.params, teacher_obs_norm)
+        mu, std = actor_forward(ts.params, teacher_obs_norm)
         rng, act_rng = jax.random.split(rng)
         action = mu + std * jax.random.normal(act_rng, mu.shape)
         action = jnp.clip(action, -1.0, 1.0)
