@@ -71,11 +71,11 @@ class PPOConfig:
     entropy_coef: float = 0.003   # 前人 0.01；取更低值防 σ 膨胀（CPU 版教训）
     value_coef: float = 0.5
     target_kl: float = 0.01     # legged_gym 默认；epoch 早停兜底（actor-only）
-    target_kl_mb: float = 0.1   # 单 mb 步 KL 上限：epoch 内每步检查，超即冻结
-    # （0.05 实测把正常学习步也拦掉→reward 平台；0.1=防灾难不防学习，
-    # 单步 ratio 上限 e^1.5≈4.5，ploss 尖峰 <1）
-    # actor 剩余步（2026-10-14 v5 实测：epoch 内 4 步无约束，加速期单 mb
-    # ratio 爆到 e^9（ploss=7598），epoch 级止损太粗兜不住）
+    target_kl_mb: float = 0.1   # 单 mb 步 KL 上限（基础值，kl_scale_std=True 时
+    # 会按当前 σ / 初始 σ 缩放；v12 判决：固定 0.2 阈值在 σ 缓慢收缩期间
+    # 让 actor 累积偏离翻倍，u43-102 KL 从 0.16 爆到 5.3 杀翻训练）
+    kl_scale_std: bool = True   # True：mb_kl_limit = target_kl_mb × (cur_σ / init_σ)
+    nan_protect: bool = True    # True：NaN 检测 + 自动回滚（v12 u103+ NaN 僵死）
     # 训练
     n_envs: int = 2048
     rollout_len: int = 24
@@ -265,11 +265,10 @@ def make_update(env, config: PPOConfig, tx):
     batch_size = config.n_envs * config.rollout_len
     n_mb = config.n_minibatches
     mb_size = batch_size // n_mb
-    mb_kl_limit = config.target_kl_mb   # 单 mb 步 KL 上限（per-mb 早停阈值）
 
     @jax.jit
     def jit_update(state, teacher_obs, rng, params, opt_state,
-                   obs_mean, obs_var, obs_count, lr_t, dr_model):
+                   obs_mean, obs_var, obs_count, lr_t, mb_kl_limit, dr_model):
         # 模型级 DR 在 vmap 外层注入：K=1 得非批化单模型、K>1 得按池批化 (K,...)
         # 模型（均保住 mjx.step 快路径，见 envs/dog_env_mjx.py 文件头「关键差异 6」）
         mx_model = env.build_model(dr_model)
@@ -480,6 +479,20 @@ def train(rng, env, config: PPOConfig,
 
     params, opt_state = ts.params, ts.opt_state
     lr_cur = float(config.lr)   # 固定 lr（adaptive 因 KL 噪声主导弃用，见 PPOConfig）
+
+    # -- 捕获初始 log_std（kl_scale_std 缩放的基准；σ=exp(log_std)）--
+    init_log_std = float(jax.device_get(
+        params["actor"]["params"]["log_std"].mean()))
+    log_fn(f"  初始 σ（全局 log_std）：{jnp.exp(jnp.float32(init_log_std)):.3f}")
+
+    # -- last-good 快照（NaN 回滚用）--
+    good_params = jax.tree_util.tree_map(jnp.copy, params)
+    good_opt_state = jax.tree_util.tree_map(jnp.copy, opt_state)
+    good_obs_mean = obs_rms.mean.copy()
+    good_obs_var = obs_rms.var.copy()
+    good_obs_count = obs_rms.count
+    nan_count = 0
+
     for update in range(n_updates):
         t0 = time.time()
         # 每个 update 重采样 K 份模型级 DR（跨 update 覆盖 DR 分布；
@@ -487,15 +500,54 @@ def train(rng, env, config: PPOConfig,
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)
 
+        # -- σ 缩放 KL 阈值 --
+        cur_log_std = float(jax.device_get(
+            params["actor"]["params"]["log_std"].mean()))
+        if config.kl_scale_std:
+            mb_kl_limit_dyn = config.target_kl_mb * (
+                jnp.exp(jnp.float32(cur_log_std)) /
+                jnp.exp(jnp.float32(init_log_std)))
+        else:
+            mb_kl_limit_dyn = jnp.float32(config.target_kl_mb)
+
         lr_t = jnp.float32(lr_cur)
         carry_out, m = jit_update(
             state, teacher_obs, rng, params, opt_state,
-            obs_rms.mean, obs_rms.var, obs_rms.count, lr_t, dr_model)
+            obs_rms.mean, obs_rms.var, obs_rms.count,
+            lr_t, mb_kl_limit_dyn, dr_model)
         (state, teacher_obs, rng, params, opt_state,
          o_mean, o_var, o_count) = carry_out
         obs_rms = RunningMeanStd(mean=o_mean, var=o_var, count=o_count)
         ts = ts.replace(params=params, opt_state=opt_state)
         m = jax.device_get(m)   # 每 update 仅这一次 host 同步
+
+        # -- NaN 检测 + 自动回滚 --
+        has_nan = any(jnp.isnan(float(v))
+                      for v in [float(m["reward"]), float(m["kl"].mean()),
+                                float(m["entropy"].mean()),
+                                float(m["value_loss"].mean()),
+                                float(m["policy_loss"].mean())])
+        if has_nan and config.nan_protect:
+            nan_count += 1
+            log_fn(f"  ⚠️ NaN 检测（累计 {nan_count} 次）：回滚到上一个良好状态")
+            params = good_params
+            opt_state = good_opt_state
+            obs_rms = RunningMeanStd(mean=good_obs_mean,
+                                     var=good_obs_var,
+                                     count=good_obs_count)
+            ts = ts.replace(params=params, opt_state=opt_state)
+            # 跳过本次日志与保存，继续下一个 update
+            if nan_count >= 3:
+                log_fn(f"  ❌ NaN 回滚累计 3 次：早停训练（策略已实质性爆炸）")
+                break
+            continue
+
+        # -- 更新 last-good 快照 --
+        good_params = jax.tree_util.tree_map(jnp.copy, params)
+        good_opt_state = jax.tree_util.tree_map(jnp.copy, opt_state)
+        good_obs_mean = obs_rms.mean.copy()
+        good_obs_var = obs_rms.var.copy()
+        good_obs_count = obs_rms.count
 
         dt = time.time() - t0
         sps = batch_size / dt if dt > 0 else 0
@@ -507,10 +559,9 @@ def train(rng, env, config: PPOConfig,
         ent = float(m["entropy"][n_active - 1])
         vloss = float(m["value_loss"][n_active - 1])
         ploss = float(m["policy_loss"][n_active - 1])
+        cur_std = float(jnp.exp(jnp.float32(cur_log_std)))
         if n_active < config.n_epochs:
             log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
-
-        # KL 监控（仅记录，不再驱动 lr 调整；epoch 早停兜底单 update 爆炸）
 
         metrics["update"].append(update)
         metrics["reward"].append(float(m["reward"]))
@@ -527,7 +578,8 @@ def train(rng, env, config: PPOConfig,
                    f"entropy={ent:.3f}, kl={kl:.4f}, "
                    f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
                    f"adv={float(m['adv_mean']):+.3f}±{float(m['adv_std']):.3f}, "
-                   f"lr={lr_cur:.2e}, dt={dt:.1f}s, sps={sps:.0f}")
+                   f"lr={lr_cur:.2e}, σ={cur_std:.3f}, kl_lim={float(mb_kl_limit_dyn):.3f}, "
+                   f"dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
             save_fn(ts, obs_rms, update)
