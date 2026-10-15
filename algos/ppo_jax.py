@@ -75,7 +75,6 @@ class PPOConfig:
     # 会按当前 σ / 初始 σ 缩放；v12 判决：固定 0.2 阈值在 σ 缓慢收缩期间
     # 让 actor 累积偏离翻倍，u43-102 KL 从 0.16 爆到 5.3 杀翻训练）
     kl_scale_std: bool = True   # True：mb_kl_limit = target_kl_mb × (cur_σ / init_σ)
-    nan_protect: bool = True    # True：NaN 检测 + 自动回滚（v12 u103+ NaN 僵死）
     # 训练
     n_envs: int = 2048
     rollout_len: int = 24
@@ -161,7 +160,11 @@ def make_ppo_loss(clip_eps, entropy_coef, value_coef, value_clip_eps):
         mu, std = actor.apply(params["actor"], batch["obs"])
         value = critic.apply(params["critic"], batch["obs"])
         log_prob = gaussian_log_prob(batch["action"], mu, std)
-        ratio = jnp.exp(log_prob - batch["old_log_prob"])
+        # -- 数值防护 1：clip exp 输入，防 overflow/underflow 成 inf/NaN --
+        # v12 u103 NaN 源头：exp(Δ) 当 Δ>30 时 overflow 成 inf，ratio clip 对
+        # inf 无效 → policy_loss=inf → gradient=NaN → params 污染
+        log_ratio = jnp.clip(log_prob - batch["old_log_prob"], -20.0, 20.0)
+        ratio = jnp.exp(log_ratio)
         adv = batch["advantage"]
         surr1 = ratio * adv
         surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
@@ -176,7 +179,8 @@ def make_ppo_loss(clip_eps, entropy_coef, value_coef, value_clip_eps):
         kl = (batch["old_log_prob"] - log_prob).mean()
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
         return loss, {"policy_loss": policy_loss, "value_loss": value_loss,
-                      "entropy": entropy, "kl": kl}
+                      "entropy": entropy, "kl": kl,
+                      "n_finite": jnp.float32(1.0)}   # finite 计数标量
     return ppo_loss
 
 
@@ -347,19 +351,26 @@ def make_update(env, config: PPOConfig, tx):
                 # 冻结 actor 剩余所有步（critic 照常）。
                 p, os_, act = c
                 (_, info), grads = grad_fn(p, mb)
+                # -- 数值防护 2：gradient finite check --
+                # exp clip 应已拦住绝大多数 NaN，万一仍有（actor μ 偏到
+                # clip 边界、adv 重尾、JAX 内部竞争条件），跳过这个 minibatch
+                # 的更新（upd 置 0），不污染 params。
+                is_finite = all(jnp.isfinite(g).all()
+                                for g in jax.tree_util.tree_leaves(grads))
                 upd, os_ = tx.update(grads, os_, p)
-                # tx 内 adam lr=1.0，在此按 lr 缩放：KL mask 只作用于
-                # actor 子树，critic 全程学习（2026-10-14 vloss 修复核心）
                 upd = {
+                    # grads 非有限时 upd 置 0 → 本 minibatch 零更新
                     "actor": jax.tree_util.tree_map(
-                        lambda u: u * (lr_t * act), upd["actor"]),
+                        lambda u: u * (lr_t * act * is_finite), upd["actor"]),
                     "critic": jax.tree_util.tree_map(
-                        lambda u: u * lr_t, upd["critic"]),
+                        lambda u: u * lr_t * is_finite, upd["critic"]),
                 }
                 p = optax.apply_updates(p, upd)
                 act = act * jnp.where(
                     info["kl"] <= mb_kl_limit, 1.0, 0.0)
-                return (p, os_, act), info
+                # 把 finite 状态传到 info 里供 epoch 层统计
+                info_f = {**info, "finite_count": is_finite}
+                return (p, os_, act), info_f
 
             (params, opt_state, act_final), infos = jax.lax.scan(
                 mb_fn, (params, opt_state, active), mbs)
@@ -368,7 +379,8 @@ def make_update(env, config: PPOConfig, tx):
             m_out = {"kl": kl_e, "entropy": infos["entropy"].mean(),
                      "value_loss": infos["value_loss"].mean(),
                      "policy_loss": infos["policy_loss"].mean(),
-                     "active": a_in}
+                     "active": a_in,
+                     "finite_count": infos["finite_count"].mean()}   # 1=全部有限
             return (params, opt_state, active), m_out
 
         rng, k_epoch = jax.random.split(rng)
@@ -485,14 +497,6 @@ def train(rng, env, config: PPOConfig,
         params["actor"]["params"]["log_std"].mean()))
     log_fn(f"  初始 σ（全局 log_std）：{jnp.exp(jnp.float32(init_log_std)):.3f}")
 
-    # -- last-good 快照（NaN 回滚用）--
-    good_params = jax.tree_util.tree_map(jnp.copy, params)
-    good_opt_state = jax.tree_util.tree_map(jnp.copy, opt_state)
-    good_obs_mean = obs_rms.mean.copy()
-    good_obs_var = obs_rms.var.copy()
-    good_obs_count = obs_rms.count
-    nan_count = 0
-
     for update in range(n_updates):
         t0 = time.time()
         # 每个 update 重采样 K 份模型级 DR（跨 update 覆盖 DR 分布；
@@ -500,7 +504,7 @@ def train(rng, env, config: PPOConfig,
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)
 
-        # -- σ 缩放 KL 阈值 --
+        # -- σ 缩放 KL 阈值（根源防护：信任域随噪声收缩）--
         cur_log_std = float(jax.device_get(
             params["actor"]["params"]["log_std"].mean()))
         if config.kl_scale_std:
@@ -521,33 +525,29 @@ def train(rng, env, config: PPOConfig,
         ts = ts.replace(params=params, opt_state=opt_state)
         m = jax.device_get(m)   # 每 update 仅这一次 host 同步
 
-        # -- NaN 检测 + 自动回滚 --
-        has_nan = any(jnp.isnan(float(v))
-                      for v in [float(m["reward"]), float(m["kl"].mean()),
+        # -- 数值 sanity check：根源防护（exp clip + grad finite）应已拦住
+        #    几乎所有 NaN；若 host 侧仍看到 NaN = 防护漏了，是 bug，直接 crash --
+        # m["finite_count"] 形状 (n_epochs,)，取所有 epoch 的均值（1=全部有限）
+        fc_arr = m.get("finite_count", None)
+        finite_count = float(fc_arr.mean()) if fc_arr is not None else 1.0
+        if finite_count < 1.0 - 1e-6:
+            log_fn(f"  ⚠️ 本次 update 有 {(1-finite_count)*100:.0f}% minibatch "
+                   f"gradient 非有限（已跳过更新），检查 reward/vloss/kl 是否"
+                   f" 异常")
+        has_nan = any(not jnp.isfinite(jnp.float32(float(v)))
+                      for v in [float(m["reward"]),
+                                float(m["kl"].mean()),
                                 float(m["entropy"].mean()),
                                 float(m["value_loss"].mean()),
                                 float(m["policy_loss"].mean())])
-        if has_nan and config.nan_protect:
-            nan_count += 1
-            log_fn(f"  ⚠️ NaN 检测（累计 {nan_count} 次）：回滚到上一个良好状态")
-            params = good_params
-            opt_state = good_opt_state
-            obs_rms = RunningMeanStd(mean=good_obs_mean,
-                                     var=good_obs_var,
-                                     count=good_obs_count)
-            ts = ts.replace(params=params, opt_state=opt_state)
-            # 跳过本次日志与保存，继续下一个 update
-            if nan_count >= 3:
-                log_fn(f"  ❌ NaN 回滚累计 3 次：早停训练（策略已实质性爆炸）")
-                break
-            continue
-
-        # -- 更新 last-good 快照 --
-        good_params = jax.tree_util.tree_map(jnp.copy, params)
-        good_opt_state = jax.tree_util.tree_map(jnp.copy, opt_state)
-        good_obs_mean = obs_rms.mean.copy()
-        good_obs_var = obs_rms.var.copy()
-        good_obs_count = obs_rms.count
+        if has_nan:
+            raise RuntimeError(
+                f"update {update}: metrics 含 NaN/inf，根源防护漏了——"
+                f"reward={float(m['reward'])}, kl={float(m['kl'].mean())}, "
+                f"entropy={float(m['entropy'].mean())}, "
+                f"vloss={float(m['value_loss'].mean())}, "
+                f"ploss={float(m['policy_loss'].mean())}. "
+                f"请检查 reward 函数、obs_rms 归一化、或 exp clip 是否生效")
 
         dt = time.time() - t0
         sps = batch_size / dt if dt > 0 else 0
