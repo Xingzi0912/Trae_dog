@@ -177,10 +177,18 @@ def make_ppo_loss(clip_eps, entropy_coef, value_coef, value_clip_eps):
                                         value_loss_clipped).mean()
         entropy = 0.5 * (jnp.log(2 * jnp.pi * std**2) + 1).sum(-1).mean()
         kl = (batch["old_log_prob"] - log_prob).mean()
+        # -- 探针：ratio clip / value clip 实际生效比例 --
+        # ratio_clip_pct 高 = 策略在大幅移动；>80% + ploss 尖峰 → 自激
+        ratio_clip_pct = jnp.float32(
+            ((ratio < 1 - clip_eps) | (ratio > 1 + clip_eps)).mean())
+        value_clip_pct = jnp.float32(
+            (jnp.abs(value - batch["old_value"]) > value_clip_eps).mean())
         loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
         return loss, {"policy_loss": policy_loss, "value_loss": value_loss,
                       "entropy": entropy, "kl": kl,
-                      "n_finite": jnp.float32(1.0)}   # finite 计数标量
+                      "n_finite": jnp.float32(1.0),
+                      "ratio_clip_pct": ratio_clip_pct,
+                      "value_clip_pct": value_clip_pct}
     return ppo_loss
 
 
@@ -279,7 +287,7 @@ def make_update(env, config: PPOConfig, tx):
 
         # ---------- 1. rollout（obs_rms 本批内固定）----------
         def scan_step(carry, _):
-            st, tobs, k = carry
+            st, tobs, k, act_clip_cnt = carry
             # normalize（rollout 期间固定，结束后才更新）
             tobs_n = (tobs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
             mu, std = actor.apply(params["actor"], tobs_n)
@@ -287,6 +295,8 @@ def make_update(env, config: PPOConfig, tx):
             # 先 clip 再算 log_prob（与 ppo_loss 一致）
             k, k_act, k_reset = jax.random.split(k, 3)
             action = mu + std * jax.random.normal(k_act, mu.shape)
+            # -- 探针：action 是否接近边界（μ 飘向 clip 边界会让 ratio 失真）--
+            n_clipped = jnp.sum(jnp.abs(action) > 0.999)
             action = jnp.clip(action, -1.0, 1.0)
             log_prob = gaussian_log_prob(action, mu, std)
             # env step + auto-reset
@@ -299,11 +309,19 @@ def make_update(env, config: PPOConfig, tx):
             st = tree_where_done(done, fresh_st, st)
             tobs_out = tree_where_done(done, fresh_tobs, tobs_new)
             out = (tobs_n, action, log_prob, value, rew, done, tobs_new)
-            return (st, tobs_out, k), out
+            return (st, tobs_out, k, act_clip_cnt + n_clipped), out
 
-        (state, teacher_obs, rng), ro = jax.lax.scan(
-            scan_step, (state, teacher_obs, rng), None, length=rollout_len)
+        carry_init = (state, teacher_obs, rng, jnp.float32(0))
+        carry_end, ro = jax.lax.scan(scan_step, carry_init, None,
+                                     length=rollout_len)
+        (state, teacher_obs, rng, act_clip_total) = carry_end
         obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr = ro
+        # -- rollout 级探针汇总 --
+        # action_clip_pct：整个 rollout 里 action 元素被 clip(-1,1) 的比例
+        # 高 = μ 被 clip 在边界 → ratio 失真，策略实际方向与采样方向偏差大
+        n_action_elts = rollout_len * config.n_envs * act_arr.shape[-1]
+        action_clip_pct = act_clip_total / jnp.float32(n_action_elts)
+        alive_pct = 1.0 - done_arr.mean()   # 1 = 全程无 reset
 
         # ---------- 2. GAE ----------
         tobs_last_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
@@ -366,21 +384,29 @@ def make_update(env, config: PPOConfig, tx):
                         lambda u: u * lr_t * is_finite, upd["critic"]),
                 }
                 p = optax.apply_updates(p, upd)
-                act = act * jnp.where(
-                    info["kl"] <= mb_kl_limit, 1.0, 0.0)
-                # 把 finite 状态传到 info 里供 epoch 层统计
-                info_f = {**info, "finite_count": is_finite}
+                kl_ok = info["kl"] <= mb_kl_limit
+                act = act * jnp.where(kl_ok, 1.0, 0.0)
+                # kl_overshoot 探针：1=本 mb 超动态阈值（clip 是 1/0）
+                info_f = {**info,
+                          "finite_count": is_finite,
+                          "kl_overshoot": jnp.where(kl_ok, 0.0, 1.0)}
                 return (p, os_, act), info_f
 
             (params, opt_state, act_final), infos = jax.lax.scan(
                 mb_fn, (params, opt_state, active), mbs)
             kl_e = infos["kl"].mean()
             active = act_final  # mb 级 act 跨 epoch 传播（epoch 早停并入其中）
-            m_out = {"kl": kl_e, "entropy": infos["entropy"].mean(),
+            # -- epoch 级探针聚合（从 infos 汇总；shape=(n_mb,)→标量）--
+            m_out = {"kl": kl_e,
+                     "entropy": infos["entropy"].mean(),
                      "value_loss": infos["value_loss"].mean(),
                      "policy_loss": infos["policy_loss"].mean(),
                      "active": a_in,
-                     "finite_count": infos["finite_count"].mean()}   # 1=全部有限
+                     "finite_count": infos["finite_count"].mean(),
+                     "ratio_clip_pct": infos["ratio_clip_pct"].mean(),
+                     "value_clip_pct": infos["value_clip_pct"].mean(),
+                     "kl_overshoot_pct": infos["kl_overshoot"].mean(),
+                     "kl_max": infos["kl"].max()}
             return (params, opt_state, active), m_out
 
         rng, k_epoch = jax.random.split(rng)
@@ -389,8 +415,25 @@ def make_update(env, config: PPOConfig, tx):
             epoch_fn, (params, opt_state, jnp.float32(1.0)), epoch_rngs)
 
         # v7 停滞诊断：adv 共模偏置假说（ploss=-3 ↔ E[adv]>0）用实测裁决
-        metrics = {"reward": rew_arr.mean(), **m_ep,
-                   "adv_mean": adv.mean(), "adv_std": adv.std()}
+        # v12 NaN 诊断：所有探针指标聚合到这里，host 侧统一打印
+        adv_mean = adv.mean()
+        adv_std = adv.std()
+        metrics = {
+            "reward": rew_arr.mean(),
+            **m_ep,   # 含 kl/entropy/vloss/ploss/finite_count/ratio_clip_pct/
+                     # value_clip_pct/kl_overshoot_pct/kl_max，shape 均 (n_epochs,)
+            "adv_mean": adv_mean,
+            "adv_std": adv_std,
+            "adv_p99": jnp.percentile(adv.reshape(-1), 99),
+            "adv_tail_pct": jnp.float32(
+                (jnp.abs(adv.reshape(-1)) > 2 * adv_std).mean()),
+            "vmean": val_arr.mean(),
+            "vmin": val_arr.min(),
+            "vmax": val_arr.max(),
+            "vstd": val_arr.std(),
+            "action_clip_pct": action_clip_pct,
+            "alive_pct": alive_pct,
+        }
         return (state, teacher_obs, rng, params, opt_state,
                 obs_mean, obs_var, obs_count), metrics
 
@@ -555,13 +598,19 @@ def train(rng, env, config: PPOConfig,
         # 逐 epoch 指标：取最后一个活跃 epoch（被 mask 冻结的 epoch 参数
         # 不变，其 kl 恒等于冻结点值；活跃序列末尾即触发早停的那个 epoch）
         n_active = max(1, int(m["active"].sum()))
-        kl = float(m["kl"][n_active - 1])
-        ent = float(m["entropy"][n_active - 1])
-        vloss = float(m["value_loss"][n_active - 1])
-        ploss = float(m["policy_loss"][n_active - 1])
+        idx = n_active - 1
+        kl = float(m["kl"][idx])
+        ent = float(m["entropy"][idx])
+        vloss = float(m["value_loss"][idx])
+        ploss = float(m["policy_loss"][idx])
+        ratio_clip = float(m["ratio_clip_pct"][idx])
+        value_clip = float(m["value_clip_pct"][idx])
+        kl_overshoot = float(m["kl_overshoot_pct"][idx])
+        kl_max = float(m["kl_max"][idx])
         cur_std = float(jnp.exp(jnp.float32(cur_log_std)))
         if n_active < config.n_epochs:
-            log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}")
+            log_fn(f"    KL 早停 @epoch {n_active - 1}, kl={kl:.4f}, "
+                   f"kl_max={kl_max:.4f}, overshoot%={kl_overshoot*100:.0f}")
 
         metrics["update"].append(update)
         metrics["reward"].append(float(m["reward"]))
@@ -573,13 +622,18 @@ def train(rng, env, config: PPOConfig,
         metrics["adv_std"].append(float(m["adv_std"]))
 
         if update % config.log_interval == 0:
-            log_fn(f"  update {update}/{n_updates}, "
-                   f"reward={float(m['reward']):.3f}, "
-                   f"entropy={ent:.3f}, kl={kl:.4f}, "
-                   f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
-                   f"adv={float(m['adv_mean']):+.3f}±{float(m['adv_std']):.3f}, "
-                   f"lr={lr_cur:.2e}, σ={cur_std:.3f}, kl_lim={float(mb_kl_limit_dyn):.3f}, "
-                   f"dt={dt:.1f}s, sps={sps:.0f}")
+            log_fn(
+                f"  update {update}/{n_updates}, "
+                f"reward={float(m['reward']):.3f}, "
+                f"entropy={ent:.3f}, kl={kl:.4f}, "
+                f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
+                f"adv={float(m['adv_mean']):+.3f}±{float(m['adv_std']):.3f} "
+                f"(p99={float(m['adv_p99']):+.2f}, tail={float(m['adv_tail_pct'])*100:.1f}%), "
+                f"σ={cur_std:.3f}, kl_lim={float(mb_kl_limit_dyn):.3f}, "
+                f"clip[R={ratio_clip*100:.0f}% V={value_clip*100:.0f}% A={float(m['action_clip_pct'])*100:.1f}%], "
+                f"v[mean={float(m['vmean']):.2f} min={float(m['vmin']):.2f} max={float(m['vmax']):.2f}], "
+                f"alive={float(m['alive_pct'])*100:.1f}%, "
+                f"dt={dt:.1f}s, sps={sps:.0f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
             save_fn(ts, obs_rms, update)
