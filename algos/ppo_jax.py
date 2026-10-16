@@ -354,8 +354,12 @@ def make_update(env, config: PPOConfig, tx):
             def mb_fn(c, mb):
                 pp, oos, act = c
                 (_, info), grads = grad_fn(pp, mb)
-                is_finite = all(jnp.isfinite(g).all()
-                                for g in jax.tree_util.tree_leaves(grads))
+                # 每个 leaf 先 .all() 归约成标量，再 jnp.all 汇总——不能用
+                # Python 内置 all()（会对 tracer 做 bool()，trace 期即报
+                # TracerBoolConversionError）。各 leaf 归约后同形 ()，可 stack。
+                is_finite = jnp.all(jnp.stack([
+                    jnp.isfinite(g).all()
+                    for g in jax.tree_util.tree_leaves(grads)]))
                 upd, oos = tx.update(grads, oos, pp)
                 upd = {
                     "actor": jax.tree_util.tree_map(
