@@ -35,7 +35,6 @@ PPO 配方（2026-10-14 对齐 rsl_rl/legged_gym 成熟配置，Go1/Go2/ANYmal �
 from __future__ import annotations
 
 import functools
-import time
 from dataclasses import dataclass
 from typing import Callable, NamedTuple
 
@@ -244,14 +243,15 @@ def create_train_state(rng, tx):
 
 
 def make_update(env, config: PPOConfig, tx):
-    """构造 PPO update 的三个独立 JIT 函数 + scan_step 优化（临时计时探针版）
+    """构造 PPO update 的三个独立 JIT 函数 + scan_step 优化
 
-    拆成 rollout / gae_rms / ppo 三段，便于 train() 分别计时定位瓶颈。
+    拆成 rollout / gae_rms / ppo 三段：避免 mega-jit 下局部改动触发整体重编译。
     scan_step 去掉了每步完整 env.reset + get_privileged_obs（原每步对
     全部 2048 env 完整初始化一遍，24 步 = 24 倍浪费），fresh 模板在
     rollout 开始前只算一次。
 
-    2026-10-15：拆分用于计时诊断 + scan_step 性能修复。
+    2026-10-15：拆分（原为计时诊断）+ scan_step 性能修复；
+    2026-10-16：耗时统计已从日志中移除（瓶颈已确认在物理求解器）。
     """
     actor, critic = make_teacher_actor(), make_teacher_critic()
     ppo_loss = make_ppo_loss(config.clip_eps, config.entropy_coef,
@@ -500,7 +500,7 @@ def train(rng, env, config: PPOConfig,
     log_fn(f"  obs_rms warmup done: mean|obs|={float(jnp.abs(obs_rms.mean).mean()):.3f}, "
            f"mean|var|={float(obs_rms.var.mean()):.3f}")
 
-    # --- 三 JIT 函数（计时诊断版，临时拆 mega-jit）---
+    # --- 三 JIT 函数（拆 mega-jit，避免局部重编译）---
     jit_rollout, jit_gae_rms, jit_ppo, actor, critic = make_update(
         env, config, tx)
     log_fn("  三 JIT 函数编译中（jit_rollout / jit_gae_rms / jit_ppo，"
@@ -541,34 +541,26 @@ def train(rng, env, config: PPOConfig,
         epoch_rngs = jax.random.split(k_epoch, config.n_epochs)
 
         # ==============================================================
-        # [计时段 1] rollout
+        # [阶段 1] rollout
         # ==============================================================
-        t_r0 = time.time()
         state, teacher_obs, rng, ro = jit_rollout(
             state, teacher_obs, rng, params,
             obs_rms.mean, obs_rms.var, mx_model,
             fresh_st, fresh_tobs)
         obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr, \
             rterms_arr, action_clip_pct, alive_pct = ro
-        # host 同步拿时间
-        jax.device_get(rew_arr)
-        dt_rollout = time.time() - t_r0
 
         # ==============================================================
-        # [计时段 2] GAE + RMS
+        # [阶段 2] GAE + RMS
         # ==============================================================
-        t_g0 = time.time()
         adv, ret, o_mean, o_var, o_count = jit_gae_rms(
             mx_model, teacher_obs, raw_arr, obs_arr, act_arr,
             lp_arr, val_arr, rew_arr, done_arr,
             params, obs_rms.mean, obs_rms.var, obs_rms.count)
-        jax.device_get(adv)
-        dt_gae = time.time() - t_g0
 
         # ==============================================================
-        # [计时段 3] PPO epochs
+        # [阶段 3] PPO epochs
         # ==============================================================
-        t_p0 = time.time()
         params, opt_state, m_ep = jit_ppo(
             obs_arr, act_arr, lp_arr, val_arr,
             adv, ret, params, opt_state,
@@ -580,13 +572,9 @@ def train(rng, env, config: PPOConfig,
         vmean = float(jax.device_get(val_arr.mean()))
         vmin = float(jax.device_get(val_arr.min()))
         vmax = float(jax.device_get(val_arr.max()))
-        dt_ppo = time.time() - t_p0
 
         obs_rms = RunningMeanStd(mean=o_mean, var=o_var, count=o_count)
         ts = ts.replace(params=params, opt_state=opt_state)
-
-        total_dt = dt_rollout + dt_gae + dt_ppo
-        sps = batch_size / total_dt if total_dt > 0 else 0
 
         # host 侧组装 metrics（reward 从 rew_arr 取，adv 从上面算好的）
         m = {
@@ -653,7 +641,6 @@ def train(rng, env, config: PPOConfig,
         metrics["adv_std"].append(adv_std)
 
         if update % config.log_interval == 0:
-            # —— 关键诊断：各阶段独立耗时 ——
             log_fn(
                 f"  update {update}/{n_updates}, "
                 f"reward={m['reward']:.3f}, "
@@ -664,9 +651,7 @@ def train(rng, env, config: PPOConfig,
                 f"kl_ovr={kl_overshoot*100:.0f}%, ep={idx}/{config.n_epochs - 1}, "
                 f"clip[R={ratio_clip*100:.0f}% V={value_clip*100:.0f}% A={float(m['action_clip_pct'])*100:.1f}%], "
                 f"finite={finite_min*100:.0f}%, "
-                f"alive={float(m['alive_pct'])*100:.1f}%, "
-                f"—— 耗时分解 rollout={dt_rollout:.2f}s gae={dt_gae:.2f}s "
-                f"ppo={dt_ppo:.2f}s | total={total_dt:.2f}s, sps={sps:.0f}")
+                f"alive={float(m['alive_pct'])*100:.1f}%")
             # —— 奖励归因：7 项分项均值（sum 应与上面的 reward 相等）——
             rt = [float(v) for v in m["rterms"]]
             log_fn(f"      └ 奖励分项 track={rt[0]:.3f} yaw={rt[1]:.3f} "
