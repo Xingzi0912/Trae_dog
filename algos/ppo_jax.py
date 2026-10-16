@@ -360,12 +360,19 @@ def make_update(env, config: PPOConfig, tx):
                 is_finite = jnp.all(jnp.stack([
                     jnp.isfinite(g).all()
                     for g in jax.tree_util.tree_leaves(grads)]))
-                upd, oos = tx.update(grads, oos, pp)
+                new_upd, new_oos = tx.update(grads, oos, pp)
+                # 非有限时不仅要丢弃该 mb 的 update，还必须**回滚 opt_state**：
+                # 脏梯度会让 adam 的 m/v（以及 clip_by_global_norm 的 NaN scale）
+                # 永久变 NaN，而 gate 只挡住当步，下一步 is_finite 恢复真值后照
+                # 样把 NaN update 落到 params 上（v12 u103 僵死的老路）。整棵
+                # opt_state 用 where 逐叶回滚，params 与动量都停在旧值。
+                oos = jax.tree_util.tree_map(
+                    lambda n, o: jnp.where(is_finite, n, o), new_oos, oos)
                 upd = {
                     "actor": jax.tree_util.tree_map(
-                        lambda u: u * (lr_t * act * is_finite), upd["actor"]),
+                        lambda u: u * (lr_t * act * is_finite), new_upd["actor"]),
                     "critic": jax.tree_util.tree_map(
-                        lambda u: u * lr_t * is_finite, upd["critic"]),
+                        lambda u: u * lr_t * is_finite, new_upd["critic"]),
                 }
                 pp = optax.apply_updates(pp, upd)
                 kl_ok = info["kl"] <= mb_kl_limit
@@ -610,6 +617,14 @@ def train(rng, env, config: PPOConfig,
         kl_overshoot = float(m["kl_overshoot_pct"][idx])
         kl_max = float(m["kl_max"][idx])
         cur_std = float(jnp.exp(jnp.float32(cur_log_std)))
+        # 非有限梯度事件可见性：finite_count 是 epoch 均值，<1 即有 mb 被打回。
+        # 该事件只回滚当步 opt_state + update（见 jit_ppo.mb_fn），params 保持
+        # 干净，所以仅告警不中断训练；持续出现才是防护失效的信号。
+        finite_min = float(m["finite_count"].min())
+        if finite_min < 1.0:
+            log_fn(f"  ⚠️ update {update}: minibatch 梯度非有限"
+                   f"（已丢弃该步 update 与 opt_state，params 未污染）"
+                   f" finite_min={finite_min:.3f}")
 
         metrics["update"].append(update)
         metrics["reward"].append(m["reward"])
@@ -630,6 +645,7 @@ def train(rng, env, config: PPOConfig,
                 f"adv={adv_mean:+.3f}±{adv_std:.3f}, "
                 f"σ={cur_std:.3f}, kl_lim={float(mb_kl_limit_dyn):.3f}, "
                 f"clip[R={ratio_clip*100:.0f}% V={value_clip*100:.0f}% A={float(m['action_clip_pct'])*100:.1f}%], "
+                f"finite={finite_min*100:.0f}%, "
                 f"alive={float(m['alive_pct'])*100:.1f}%, "
                 f"—— 耗时分解 rollout={dt_rollout:.2f}s gae={dt_gae:.2f}s "
                 f"ppo={dt_ppo:.2f}s | total={total_dt:.2f}s, sps={sps:.0f}")

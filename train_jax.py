@@ -289,8 +289,12 @@ def main():
         log_interval=1,
     )
     rng, distill_rng = jax.random.split(rng)
+    # 蒸馏的观测归一化必须与教师训练（PPO rollout 内 obs_rms 归一化）以及
+    # 部署端（npz 存 obs_mean/var）三方一致：教师用完整 99 维统计量，学生
+    # 用前 61 维切片。传入教师训出的 obs_rms，见 distill_jax 模块 docstring。
+    log(f"  蒸馏输入归一化：教师 99 维 obs_rms / 学生前 61 维切片")
     student_ts, student_metrics = train_student(
-        distill_rng, teacher_ts, env, distill_cfg,
+        distill_rng, teacher_ts, env, obs_rms, distill_cfg,
         log_fn=log, save_fn=student_save_fn)
 
     # 学生用 61 维观测的 obs_rms（从教师 99 维的前 61 维截取）

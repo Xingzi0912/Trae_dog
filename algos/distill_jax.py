@@ -18,6 +18,14 @@
     2. 统一用 env.get_privileged_obs（旧版 collect_distill_data 内联了
        jax.vmap(env._get_privileged_obs) 与 env.get_privileged_obs 重复）
     3. 加 log_fn / save_fn 回调，与 ppo_jax 接口一致
+
+关键修复（2026-10-16，归一化一致性）：
+    旧版蒸馏全程喂**原始**观测：教师是按 obs_rms 归一化观测训练的
+    （ppo_jax.jit_rollout 内 (tobs-mean)/sqrt(var)），这里却用原始 obs 求
+    教师 μ/V → 目标在分布外；学生也被拟合成"吃原始观测"的策略，而部署端
+    npz 存了 obs_mean/obs_var 且推理前归一化 → 三段尺度互不一致。
+    现 collect_distill_data 接收教师 obs_rms：教师用完整 99 维，学生用前
+    OBS_DIM(61) 维切片（= 教师标准观测部分，与 train_jax 存进 npz 的一致）。
 """
 
 from __future__ import annotations
@@ -64,11 +72,22 @@ def make_distill_loss(alpha, beta):
     return distill_loss
 
 
+def _normalize(x, mean, var):
+    """obs_rms 归一化：与 ppo_jax.jit_rollout 及部署端 npz（obs_mean/obs_var）同式"""
+    return (x - mean) / jnp.sqrt(var + 1e-8)
+
+
 def collect_distill_data(rng, teacher_ts, env, n_steps,
-                         teacher_forward, n_envs):
+                         teacher_forward, obs_rms):
     """用教师网络跑 rollout，收集蒸馏数据
 
-    返回 dict: obs_61 (n_steps*n_envs, 61), mu_teacher, v_teacher
+    Args:
+        obs_rms: 教师训练收敛后的 99 维观测归一化统计量（train_teacher 返回）。
+            **必须传入**：教师按归一化观测训练，喂原始观测会让 μ/V 目标跑出
+            分布；学生侧取前 env.OBS_DIM 维切片，与部署 npz 的 obs_mean/var 同源。
+
+    返回 dict: obs (n_steps*n_envs, 61)（已按 obs_rms[:61] 归一化）,
+              mu_teacher, v_teacher
     """
     obs_list, mu_list, v_list = [], [], []
     rng, reset_rng, k_dr = jax.random.split(rng, 3)
@@ -80,7 +99,10 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
     teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
     for _ in range(n_steps):
-        mu, std, value = teacher_forward(teacher_ts.params, teacher_obs)
+        # 教师侧用完整 99 维统计量归一化（与 PPO rollout 内的输入一致）
+        mu, std, value = teacher_forward(
+            teacher_ts.params,
+            _normalize(teacher_obs, obs_rms.mean, obs_rms.var))
         obs_list.append(obs)
         mu_list.append(mu)
         v_list.append(value)
@@ -99,17 +121,26 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
+    d = env.OBS_DIM
     return {
-        "obs": jnp.concatenate(obs_list, axis=0),
+        # 学生输入 = 教师观测的前 61 维（标准观测），按同一份 obs_rms 的前 61 维归一化
+        "obs": _normalize(jnp.concatenate(obs_list, axis=0),
+                          obs_rms.mean[:d], obs_rms.var[:d]),
         "mu_teacher": jnp.concatenate(mu_list, axis=0),
         "v_teacher": jnp.concatenate(v_list, axis=0),
     }
 
 
-def train_student(rng, teacher_ts, env, config: DistillConfig,
+def train_student(rng, teacher_ts, env, obs_rms, config: DistillConfig,
                   log_fn: Callable[[str], None] = print,
                   save_fn: Callable | None = None):
-    """蒸馏训练学生网络"""
+    """蒸馏训练学生网络
+
+    Args:
+        obs_rms: 教师训练收敛后的 99 维 / 61 维观测归一化统计量（train_teacher
+            返回的 RunningMeanStd，99 维）。数据采集与学生输入都按它归一化，
+            与 PPO rollout、部署端 npz 三方对齐（见模块 docstring 关键修复）。
+    """
     tx = optax.adam(config.lr)
     student = make_student()
     rng, init_rng = jax.random.split(rng)
@@ -140,7 +171,7 @@ def train_student(rng, teacher_ts, env, config: DistillConfig,
         rng, data_rng = jax.random.split(rng)
         data = collect_distill_data(data_rng, teacher_ts, env,
                                     config.rollout_len, teacher_forward,
-                                    config.n_envs)
+                                    obs_rms)
 
         # 训练学生
         total_samples = data["obs"].shape[0]
