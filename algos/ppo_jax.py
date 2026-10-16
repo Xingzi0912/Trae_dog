@@ -617,6 +617,13 @@ def train(rng, env, config: PPOConfig,
         kl_overshoot = float(m["kl_overshoot_pct"][idx])
         kl_max = float(m["kl_max"][idx])
         cur_std = float(jnp.exp(jnp.float32(cur_log_std)))
+        # KL 冻结事件可见性：kl_overshoot_pct 非零 ⟺ 该 update 里 actor 被
+        # KL 上限打断过。每次 update 至多一个 epoch 会超限（超限的那个 mb
+        # 仍会施加，随后 act 置 0→后续 mb 的 kl=0），所以该 epoch 的占比恒为
+        # 1/n_minibatches（4 个 mb 时即 25%），0% = 全程没触发。
+        # idx = 最后一个"起始时未冻结"的 epoch = 冻结发生的 epoch，故
+        # ep=0/4 表示 epoch 0 就被冻（actor 只拿到 1/5 梯度步，v12 最坏情形），
+        # ep=4/4 表示冻结最晚发生或没发生。
         # 非有限梯度事件可见性：finite_count 是 epoch 均值，<1 即有 mb 被打回。
         # 该事件只回滚当步 opt_state + update（见 jit_ppo.mb_fn），params 保持
         # 干净，所以仅告警不中断训练；持续出现才是防护失效的信号。
@@ -644,6 +651,7 @@ def train(rng, env, config: PPOConfig,
                 f"vloss={vloss:.3f}, ploss={ploss:.4f}, "
                 f"adv={adv_mean:+.3f}±{adv_std:.3f}, "
                 f"σ={cur_std:.3f}, kl_lim={float(mb_kl_limit_dyn):.3f}, "
+                f"kl_ovr={kl_overshoot*100:.0f}%, ep={idx}/{config.n_epochs - 1}, "
                 f"clip[R={ratio_clip*100:.0f}% V={value_clip*100:.0f}% A={float(m['action_clip_pct'])*100:.1f}%], "
                 f"finite={finite_min*100:.0f}%, "
                 f"alive={float(m['alive_pct'])*100:.1f}%, "
