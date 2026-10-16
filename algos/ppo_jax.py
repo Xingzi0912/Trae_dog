@@ -285,23 +285,30 @@ def make_update(env, config: PPOConfig, tx):
             st, obs, rew, term, trunc, info = env.step(st, action, mx_model)
             done = jnp.logical_or(term, trunc)
             tobs_new = make_teacher_obs(obs, info["privileged_obs"])
+            # 奖励分项：7 项各自对 N 个 env 求均值 → (7,)，供日志归因
+            # （顺序 track/yaw/upright/energy/jerk/vz/rp，sum 应等于 reward）
+            rterms = jnp.mean(jnp.stack(
+                [info["r_track"], info["r_yaw"], info["r_upright"],
+                 info["r_energy"], info["r_jerk"], info["r_vz"], info["r_rp"]],
+                axis=-1), axis=0)
             # ← 关键优化：从 carry 取预计算的 fresh，不再每步完整 reset 2048 env
             st = tree_where_done(done, fresh_st, st)
             tobs_out = tree_where_done(done, fresh_tobs, tobs_new)
-            out = (tobs_n, action, log_prob, value, rew, done, tobs_new)
+            out = (tobs_n, action, log_prob, value, rew, done, tobs_new, rterms)
             return (st, tobs_out, k, act_clip_cnt + n_clipped), out
 
         carry_init = (state, teacher_obs, rng, jnp.float32(0))
         carry_end, ro = jax.lax.scan(scan_step, carry_init, None,
                                      length=rollout_len)
         (state, teacher_obs, rng, act_clip_total) = carry_end
-        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr = ro
+        (obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
+         rterms_arr) = ro
         n_action_elts = rollout_len * config.n_envs * act_arr.shape[-1]
         action_clip_pct = act_clip_total / jnp.float32(n_action_elts)
         alive_pct = 1.0 - done_arr.mean()
         return state, teacher_obs, rng, (
             obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
-            action_clip_pct, alive_pct)
+            rterms_arr, action_clip_pct, alive_pct)
 
     # ------------------------------------------------------------------
     # Part 2: JIT GAE + obs_rms 更新
@@ -542,7 +549,7 @@ def train(rng, env, config: PPOConfig,
             obs_rms.mean, obs_rms.var, mx_model,
             fresh_st, fresh_tobs)
         obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr, \
-            action_clip_pct, alive_pct = ro
+            rterms_arr, action_clip_pct, alive_pct = ro
         # host 同步拿时间
         jax.device_get(rew_arr)
         dt_rollout = time.time() - t_r0
@@ -592,6 +599,9 @@ def train(rng, env, config: PPOConfig,
             "vmean": vmean, "vmin": vmin, "vmax": vmax,
             "action_clip_pct": float(jax.device_get(action_clip_pct)),
             "alive_pct": float(jax.device_get(alive_pct)),
+            # 奖励分项：整条 rollout 的 T×N 均值，(7,) 顺序
+            # track/yaw/upright/energy/jerk/vz/rp
+            "rterms": jax.device_get(rterms_arr.mean(axis=0)),
             **m_ep_arr,
         }
 
@@ -657,6 +667,12 @@ def train(rng, env, config: PPOConfig,
                 f"alive={float(m['alive_pct'])*100:.1f}%, "
                 f"—— 耗时分解 rollout={dt_rollout:.2f}s gae={dt_gae:.2f}s "
                 f"ppo={dt_ppo:.2f}s | total={total_dt:.2f}s, sps={sps:.0f}")
+            # —— 奖励归因：7 项分项均值（sum 应与上面的 reward 相等）——
+            rt = [float(v) for v in m["rterms"]]
+            log_fn(f"      └ 奖励分项 track={rt[0]:.3f} yaw={rt[1]:.3f} "
+                   f"upright={rt[2]:.3f} energy={rt[3]:.3f} "
+                   f"jerk={rt[4]:.3f} vz={rt[5]:.3f} rp={rt[6]:.3f} "
+                   f"| sum={sum(rt):.3f}")
 
         if save_fn is not None and (update + 1) % config.save_interval == 0:
             save_fn(ts, obs_rms, update)
