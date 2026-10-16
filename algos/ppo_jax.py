@@ -74,6 +74,20 @@ class PPOConfig:
     # 会按当前 σ / 初始 σ 缩放；v12 判决：固定 0.2 阈值在 σ 缓慢收缩期间
     # 让 actor 累积偏离翻倍，u43-102 KL 从 0.16 爆到 5.3 杀翻训练）
     kl_scale_std: bool = True   # True：mb_kl_limit = target_kl_mb × (cur_σ / init_σ)
+    # σ 退火（2026-10-16 诊断后新增）：
+    #   adam 每步只把 log_std 移动 ≈lr(5e-5)，实测 27 个 update 只从 0.607 到
+    #   0.603 ⇒ 整个 406-update run 里学习型 σ 最多降到 ~0.57。而 σ=0.6 对
+    #   residual_scale=0.2 意味着 rollout 的动作基本是采样噪声（r_energy=-0.232
+    #   ≈ 12·w_energy·σ²=0.218、r_jerk=-0.068 ≈ i.i.d. 预测 -0.087 ⇒ μ 的 RMS
+    #   只有 ~0.3），μ 的学习信号被噪声埋掉；且 actor 被 KL 闸门冻结时
+    #   log_std 一起冻（它在 actor 参数里）。
+    #   改为 host 侧每 update 线性重写 log_std 均值：σ_start → σ_end，逐维
+    #   离散度保留（整体平移），σ 不再依赖梯度。
+    std_schedule: bool = True
+    std_start: float = 0.6
+    std_end: float = 0.2
+    # 退火覆盖的 update 数（之后保持 std_end）；0 或 <0 表示铺满整个 run
+    std_anneal_updates: int = 120
     # 训练
     n_envs: int = 2048
     rollout_len: int = 24
@@ -514,11 +528,36 @@ def train(rng, env, config: PPOConfig,
         params["actor"]["params"]["log_std"].mean()))
     log_fn(f"  初始 σ：{jnp.exp(jnp.float32(init_log_std)):.3f}")
 
+    # σ 退火：host 侧重写 actor 的 log_std（整体平移，保留逐维离散度）。
+    # 副作用：params 由 FrozenDict 变普通 dict，pytree 类型变一次 ⇒ 三个 jit
+    # 各多编译一次，此后结构稳定。σ 因此不再受 KL 冻结影响（原来 log_std 在
+    # actor 参数里，被 act 掩码一起冻住）。
+    def _with_log_std(p, log_std):
+        return {**p, "actor": {**p["actor"],
+                               "params": {**p["actor"]["params"],
+                                          "log_std": log_std}}}
+
+    anneal_n = (config.std_anneal_updates
+                if config.std_anneal_updates > 0 else n_updates)
+    # 续训时 checkpoint 的 σ 可能已低于 std_start：退火起点取当前 σ，保证单调不升
+    std_start_eff = min(config.std_start,
+                        float(jnp.exp(jnp.float32(init_log_std))))
+    if config.std_schedule:
+        log_fn(f"  σ 退火：{std_start_eff:.3f} → {config.std_end:.3f}，"
+               f"在 {anneal_n} 个 update 内线性，之后保持（σ 不再依赖梯度）")
+
     for update in range(n_updates):
         # ---- host 侧开销：DR 重采样 + fresh 模板预算 + KL 阈值 ----
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)
         mx_model = env.build_model(dr_model)
+
+        if config.std_schedule:
+            std_t = std_start_eff + (config.std_end - std_start_eff) * min(
+                1.0, update / max(1, anneal_n - 1))
+            ls_old = params["actor"]["params"]["log_std"]
+            params = _with_log_std(
+                params, ls_old + (jnp.log(jnp.float32(std_t)) - ls_old.mean()))
 
         cur_log_std = float(jax.device_get(
             params["actor"]["params"]["log_std"].mean()))
