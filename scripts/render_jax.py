@@ -6,6 +6,8 @@
     python scripts/render_jax.py --video --steps 1000
     python scripts/render_jax.py --video --steps 1000 --ckpt checkpoints/dog_cmd_mjx_teacher.pkl
     python scripts/render_jax.py --video --steps 1000 --ckpt checkpoints/dog_cmd_mjx_teacher.pkl --out logs/u37.mp4
+    # 本地交互式（需要显示器 + pygame）
+    python scripts/render_jax.py -i --ckpt checkpoints/dog_cmd_mjx_teacher.pkl
 
 视频生成后 scp 回本地：
     scp ubuntu@<server>:/home/ubuntu/Sxy_bigdog/Trae_dog/logs/dog_walk.mp4 .
@@ -16,6 +18,10 @@
   3. 每步：obs_rms 归一化 → Actor.apply 取 μ（确定性）→ env.step
   4. MJX state 用 mjx.get_data 转回 mujoco.MjData，Renderer 每帧 render
   5. matplotlib FuncAnimation 合成 mp4（无 ffmpeg 则 gif）
+
+交互式模式：
+  pygame 窗口 + 键盘回调。Renderer 离屏 render → RGB numpy array →
+  pygame.surfarray.make_surface → 贴到窗口。完全不依赖独立 GL context，不会黑屏。
 """
 
 import argparse
@@ -64,7 +70,7 @@ def make_deterministic_actor_apply(actor):
 
 
 def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
-    """交互式键盘控制（需要本地显示器 + glfw）
+    """交互式键盘控制（需要本地显示器 + pygame）
 
     按键：
       W/S  前进/后退 (vx)
@@ -74,7 +80,8 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
       R    重置环境
       Esc  退出
     """
-    import glfw
+    import pygame
+    from pygame import surfarray
 
     scene_xml = str(Path(__file__).parent.parent / "envs" / "scene_mjx.xml")
     mj_model = mujoco.MjModel.from_xml_path(scene_xml)
@@ -105,70 +112,80 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
     rng = jax.random.PRNGKey(seed)
     state, obs = env.reset(rng)
 
-    glfw.init()
-    win = glfw.create_window(800, 600, "Dog Interactive", None, None)
-    glfw.make_context_current(win)
+    # --- pygame 窗口 ---
+    pygame.init()
+    WIDTH, HEIGHT = 640, 480
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Dog Interactive")
+    clock = pygame.time.Clock()
 
-    def key_cb(_, k, sc, a, m):
-        if a != glfw.PRESS:
-            return
-        if k == glfw.KEY_W:   cmd["vx"] += cmd_step
-        elif k == glfw.KEY_S: cmd["vx"] -= cmd_step
-        elif k == glfw.KEY_A: cmd["vy"] -= cmd_step
-        elif k == glfw.KEY_D: cmd["vy"] += cmd_step
-        elif k == glfw.KEY_Q: cmd["yaw"] += yaw_step
-        elif k == glfw.KEY_E: cmd["yaw"] -= yaw_step
-        elif k == glfw.KEY_X: cmd.update(vx=0.0, vy=0.0, yaw=0.0)
-        elif k == glfw.KEY_R:
-            nonlocal state, obs, rng
-            rng, k2 = jax.random.split(rng)
-            state, obs = env.reset(k2)
-            print("  重置")
-        elif k == glfw.KEY_ESCAPE:
-            glfw.set_window_should_close(win, True)
-        clamp_cmd()
-
-    glfw.set_key_callback(win, key_cb)
-
-    renderer = mujoco.Renderer(mj_model, height=600, width=800)
+    # --- mujoco Renderer（离屏，完全不碰窗口）---
+    renderer = mujoco.Renderer(mj_model, height=HEIGHT, width=WIDTH)
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_FREE
     cam.distance = 2.2
     cam.elevation = -15
     cam.azimuth = 90
 
+    running = True
+    while running:
+        # --- 键盘 ---
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_w:     cmd["vx"] += cmd_step
+                elif ev.key == pygame.K_s:   cmd["vx"] -= cmd_step
+                elif ev.key == pygame.K_a:   cmd["vy"] -= cmd_step
+                elif ev.key == pygame.K_d:   cmd["vy"] += cmd_step
+                elif ev.key == pygame.K_q:   cmd["yaw"] += yaw_step
+                elif ev.key == pygame.K_e:   cmd["yaw"] -= yaw_step
+                elif ev.key == pygame.K_x:   cmd.update(vx=0.0, vy=0.0, yaw=0.0)
+                elif ev.key == pygame.K_r:
+                    rng, k2 = jax.random.split(rng)
+                    state, obs = env.reset(k2)
+                    print("  重置")
+                elif ev.key == pygame.K_ESCAPE:
+                    running = False
+                clamp_cmd()
+
+        # --- Actor step ---
+        priv = env.get_privileged_obs(state)
+        teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+        cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
+        teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
+        teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
+        obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+        action = jnp.clip(actor_apply(params["actor"], obs_n), -1.0, 1.0)
+
+        state, obs, reward, term, trunc, info = single_step(state, action)
+        if bool(term[0]) or bool(trunc[0]):
+            rng, k2 = jax.random.split(rng)
+            state, obs = env.reset(k2)
+
+        # --- MJX → MjData → 离屏 render ---
+        mj_data = mjx.get_data(mj_model, state.dx)[0]
+        cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
+        renderer.update_scene(mj_data, camera=cam)
+        rgb = renderer.render()  # numpy (H, W, 3) uint8
+
+        # --- numpy → pygame surface → 贴窗口 ---
+        # pygame.surfarray 期望 (W, H, 3) + 颜色顺序兼容（pygame 用 BGR）
+        # transpose (H,W,3) → (W,H,3)；flip 最后一维做 RGB→BGR
+        rgb_w = np.transpose(rgb, (1, 0, 2))  # (W, H, 3)
+        rgb_bgr = rgb_w[:, :, ::-1].copy()     # RGB → BGR，复制成连续内存
+        surf = surfarray.make_surface(rgb_bgr)
+        screen.blit(surf, (0, 0))
+        pygame.display.flip()
+
+        clock.tick(50)  # ~50Hz
+
     try:
-        while not glfw.window_should_close(win):
-            glfw.poll_events()
-
-            # 拼特权信息 (61+38=99)
-            priv = env.get_privileged_obs(state)  # (1, 38)
-            teacher_obs = jnp.concatenate([obs, priv], axis=-1)
-            # 覆盖指令槽（[58:61] 是标准 obs 里的指令，[99-3=96:99] 也是，两处都改）
-            cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
-            teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
-            teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
-            obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-            action = jnp.clip(actor_apply(params["actor"], obs_n), -1.0, 1.0)
-
-            state, obs, reward, term, trunc, info = single_step(state, action)
-            if bool(term[0]) or bool(trunc[0]):
-                rng, k2 = jax.random.split(rng)
-                state, obs = env.reset(k2)
-
-            mj_data = mjx.get_data(mj_model, state.dx)[0]
-            cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
-            renderer.update_scene(mj_data, camera=cam)
-            renderer.render()
-
-            glfw.swap_buffers(win)
-            glfw.wait_events_timeout(0.02)
-
-    finally:
         renderer.close()
-        glfw.destroy_window(win)
-        glfw.terminate()
-        print("  退出")
+    except Exception:
+        pass
+    pygame.quit()
+    print("  退出")
 
 
 def run_offscreen(env, actor_apply, params, obs_rms_dict,
@@ -283,7 +300,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="logs/dog_walk")
     ap.add_argument("--interactive", "-i", action="store_true",
-                    help="键盘控制模式（WASD/Q/E 改指令，需本地 glfw + 显示器）")
+                    help="键盘控制模式（WASD/Q/E 改指令，需本地 pygame + 显示器）")
     ap.add_argument("--video", action="store_true", default=False,
                     help="离屏视频模式（默认）")
     args = ap.parse_args()
@@ -318,6 +335,12 @@ def main():
 
     if args.interactive:
         print("模式: 交互式键盘控制（-i）")
+        # 交互式需要 pygame
+        try:
+            import pygame  # noqa: F401
+        except ImportError:
+            print("❌ 缺 pygame，装一下：pip install pygame")
+            sys.exit(1)
         run_interactive(env, actor_apply, params, obs_rms_dict, args.seed)
     else:
         print("模式: 离屏视频（--video）")
