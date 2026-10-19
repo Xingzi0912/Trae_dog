@@ -33,8 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import jax
 import jax.numpy as jnp
-import mjx
 import mujoco
+from mujoco import mjx
 import numpy as np
 from flax.training.train_state import TrainState
 import optax
