@@ -84,8 +84,12 @@ class PPOConfig:
     #   改为 host 侧每 update 线性重写 log_std 均值：σ_start → σ_end，逐维
     #   离散度保留（整体平移），σ 不再依赖梯度。
     std_schedule: bool = True
-    std_start: float = 0.6
-    std_end: float = 0.2
+    # v15：σ 钉 0.5，拆除退火定时器。依据：v13/v14 两个 run 都在 σ≈0.5
+    # 见顶（v13 u24 σ=0.519、v14 u30 σ=0.499），σ 是唯一在两个 run 间
+    # 严格同步的变量；钉 0.5 后 kl_scale_std 阈值恒定
+    # 0.1×(0.5/0.607)≈0.082。若中途 kl 再加速则 v16 = n_minibatches 4→32。
+    std_start: float = 0.5
+    std_end: float = 0.5
     # 退火覆盖的 update 数（之后保持 std_end）；0 或 <0 表示铺满整个 run
     std_anneal_updates: int = 120
     # 训练
