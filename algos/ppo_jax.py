@@ -400,14 +400,20 @@ def make_update(env, config: PPOConfig, tx):
                 # opt_state 用 where 逐叶回滚，params 与动量都停在旧值。
                 oos = jax.tree_util.tree_map(
                     lambda n, o: jnp.where(is_finite, n, o), new_oos, oos)
+                # v18：check-then-apply。pre-step KL 超限的 mb 直接不施加、
+                # 并冻结 actor 剩余步——违规步永不落地（v17 及以前为
+                # apply-then-check：超限步已落到 params 上才冻结后续，
+                # 分布被推移 → 下一 mb pre-KL 更高 → 连锁超限的自激回路，
+                # 即"稳定但饿死"的成因，2026-10-20 定位）。
+                kl_ok = info["kl"] <= mb_kl_limit
+                fire = act * kl_ok * is_finite
                 upd = {
                     "actor": jax.tree_util.tree_map(
-                        lambda u: u * (lr_t * act * is_finite), new_upd["actor"]),
+                        lambda u: u * (lr_t * fire), new_upd["actor"]),
                     "critic": jax.tree_util.tree_map(
                         lambda u: u * lr_t * is_finite, new_upd["critic"]),
                 }
                 pp = optax.apply_updates(pp, upd)
-                kl_ok = info["kl"] <= mb_kl_limit
                 act = act * jnp.where(kl_ok, 1.0, 0.0)
                 info_f = {**info,
                           "finite_count": is_finite,
