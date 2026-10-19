@@ -61,6 +61,108 @@ def make_deterministic_actor_apply(actor):
     return apply
 
 
+def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
+    """交互式键盘控制（需要本地显示器 + glfw）
+
+    按键：
+      W/S  前进/后退 (vx)
+      A/D  左移/右移 (vy)
+      Q/E  左转/右转 (yaw_rate)
+      X    指令归零
+      R    重置环境
+      Esc  退出
+    """
+    import glfw
+
+    mj_model = mujoco.MjModel.from_xml_path(env.model_xml)
+    mjx_model = mjx.put_model(mj_model)
+
+    if obs_rms_dict is not None:
+        obs_mean = jnp.asarray(obs_rms_dict["mean"])
+        obs_var = jnp.asarray(obs_rms_dict["var"])
+    else:
+        obs_mean = jnp.zeros(99)
+        obs_var = jnp.ones(99)
+
+    @jax.jit
+    def single_step(state, action):
+        return env.step(state, action, mx_model=mjx_model)
+
+    cmd = {"vx": 0.0, "vy": 0.0, "yaw": 0.0}
+    cmd_step = 0.15
+    yaw_step = 0.5
+    cmd_range = {"vx": (-0.5, 1.5), "vy": (-0.5, 0.5), "yaw": (-2.0, 2.0)}
+
+    def clamp_cmd():
+        for k, (lo, hi) in cmd_range.items():
+            cmd[k] = max(lo, min(hi, cmd[k]))
+
+    print("  W/S vx | A/D vy | Q/E yaw | X 归零 | R 重置 | Esc 退出")
+
+    rng = jax.random.PRNGKey(seed)
+    state, obs = env.reset(rng)
+
+    glfw.init()
+    win = glfw.create_window(800, 600, "Dog Interactive", None, None)
+    glfw.make_context_current(win)
+
+    def key_cb(_, k, sc, a, m):
+        if a != glfw.PRESS:
+            return
+        if k == glfw.KEY_W:   cmd["vx"] += cmd_step
+        elif k == glfw.KEY_S: cmd["vx"] -= cmd_step
+        elif k == glfw.KEY_A: cmd["vy"] -= cmd_step
+        elif k == glfw.KEY_D: cmd["vy"] += cmd_step
+        elif k == glfw.KEY_Q: cmd["yaw"] += yaw_step
+        elif k == glfw.KEY_E: cmd["yaw"] -= yaw_step
+        elif k == glfw.KEY_X: cmd.update(vx=0.0, vy=0.0, yaw=0.0)
+        elif k == glfw.KEY_R:
+            nonlocal state, obs, rng
+            rng, k2 = jax.random.split(rng)
+            state, obs = env.reset(k2)
+            print("  重置")
+        elif k == glfw.KEY_ESCAPE:
+            glfw.set_window_should_close(win, True)
+        clamp_cmd()
+
+    glfw.set_key_callback(win, key_cb)
+
+    renderer = mujoco.Renderer(mj_model, height=600, width=800)
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    cam.distance = 2.2
+    cam.elevation = -15
+    cam.azimuth = 90
+
+    try:
+        while not glfw.window_should_close(win):
+            glfw.poll_events()
+
+            cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
+            obs_mod = obs.at[0, 58:61].set(cmd_arr[0])
+            obs_n = (obs_mod - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+            action = jnp.clip(actor_apply(params["actor"]["params"], obs_n), -1.0, 1.0)
+
+            state, obs, reward, term, trunc, info = single_step(state, action)
+            if bool(term[0]) or bool(trunc[0]):
+                rng, k2 = jax.random.split(rng)
+                state, obs = env.reset(k2)
+
+            mj_data = mjx.get_data(mj_model, state.mjx_data)
+            cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
+            renderer.update_scene(mj_data, camera=cam)
+            renderer.render()
+
+            glfw.swap_buffers(win)
+            glfw.wait_events_timeout(0.02)
+
+    finally:
+        renderer.close()
+        glfw.destroy_window(win)
+        glfw.terminate()
+        print("  退出")
+
+
 def run_offscreen(env, actor_apply, params, obs_rms_dict,
                   n_steps: int, out_path: Path, seed: int = 0):
     """离屏渲染，matplotlib 存 mp4 或 gif"""
@@ -164,17 +266,19 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="JAX/Flax + MJX 离屏渲染")
-    ap.add_argument("--ckpt", default="checkpoints/dog_cmd_mjx_teacher.pkl",
-                    help="Flax checkpoint（params + obs_rms）")
-    ap.add_argument("--steps", type=int, default=1000,
-                    help="渲染步数（默认 1000 即 20s @50Hz）")
+    ap = argparse.ArgumentParser(description="JAX/Flax + MJX 渲染（离屏视频 或 交互控制）")
+    ap.add_argument("--ckpt", default="checkpoints/dog_cmd_mjx_teacher.pkl")
+    ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="logs/dog_walk",
-                    help="视频输出路径（不含扩展名，自动 .mp4 或 .gif）")
-    ap.add_argument("--video", action="store_true", default=True,
-                    help="离屏渲染（默认开启；保留此参数仅为兼容旧命令行）")
+    ap.add_argument("--out", default="logs/dog_walk")
+    ap.add_argument("--interactive", "-i", action="store_true",
+                    help="键盘控制模式（WASD/Q/E 改指令，需本地 glfw + 显示器）")
+    ap.add_argument("--video", action="store_true", default=False,
+                    help="离屏视频模式（默认）")
     args = ap.parse_args()
+
+    if not args.interactive and not args.video:
+        args.video = True  # 默认视频模式
 
     # --- checkpoint ---
     ckpt_path = Path(args.ckpt)
@@ -201,8 +305,13 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    run_offscreen(env, actor_apply, params, obs_rms_dict,
-                  args.steps, out_path, args.seed)
+    if args.interactive:
+        print("模式: 交互式键盘控制（-i）")
+        run_interactive(env, actor_apply, params, obs_rms_dict, args.seed)
+    else:
+        print("模式: 离屏视频（--video）")
+        run_offscreen(env, actor_apply, params, obs_rms_dict,
+                      args.steps, out_path, args.seed)
 
 
 if __name__ == "__main__":
