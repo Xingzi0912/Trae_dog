@@ -179,6 +179,13 @@ def make_ppo_loss(clip_eps, entropy_coef, value_coef, value_clip_eps):
         log_ratio = jnp.clip(log_prob - batch["old_log_prob"], -20.0, 20.0)
         ratio = jnp.exp(log_ratio)
         adv = batch["advantage"]
+        # --- per-minibatch advantage 归一化 ---
+        # purejaxrl#L227；作用：把 adv 从原始量级（实测 ≈ ±8）拉回 ≈ N(0,1)，
+        # 这样同样的 lr/clip_eps/KL 闸门看到的是"每步相对变化"而非绝对量，
+        # 有效步长缩 ~adv_std 倍（上次 adv_std≈6.8 → ~7×），单 mb KL 从 0.2~0.43
+        # 回到 0.03~0.06 → KL 闸门不再第一步就触发（ep 从 0/4 回升），且 critic
+        # 拟合 return 不受影响。v14 新增。
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         surr1 = ratio * adv
         surr2 = jnp.clip(ratio, 1 - clip_eps, 1 + clip_eps) * adv
         policy_loss = -jnp.minimum(surr1, surr2).mean()
