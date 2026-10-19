@@ -19,9 +19,15 @@
 """
 
 import argparse
+import os
 import pickle
 import sys
 from pathlib import Path
+
+# 必须在 import jax 之前设置
+# 公用服务器：JAX 默认占满所有 GPU 显存，这里限制到 10%（渲染不吃 GPU，
+# 只是 MJX 仿真可能会 lazy init 一个 GPU context；给最小配额避免干扰他人）
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.10")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
