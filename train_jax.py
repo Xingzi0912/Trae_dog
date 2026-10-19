@@ -133,10 +133,8 @@ def main():
                         help="每个 env 每轮收集的步数")
     parser.add_argument("--n_epochs", type=int, default=5,
                         help="PPO 每 update 的 epoch 数（legged_gym 默认 5）")
-    parser.add_argument("--n_minibatches", type=int, default=32,
-                        help="每个 epoch 的 minibatch 数（v15 起默认 32：mb 12288→1536，"
-                             "治大 mb 单步 KL 过大引发的冻结-释放自激；"
-                             "PureJaxRL 实证配方 mb=640。legged_gym 原为 4）")
+    parser.add_argument("--n_minibatches", type=int, default=4,
+                        help="每个 epoch 的 minibatch 数（legged_gym 默认 4）")
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="固定学习率（KL 由 epoch 早停兜底控制）")
     parser.add_argument("--distill_steps", type=int, default=None,
