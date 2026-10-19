@@ -186,15 +186,12 @@ def main():
     print(f"checkpoint: {ckpt_path}")
     print(f"  obs_rms: {'有' if obs_rms_dict is not None else '无（学生 checkpoint）'}")
 
-    # --- 环境（n_envs=1，关 DR 关噪声）---
+    # --- 环境（n_envs=1，关 DR）---
     env_cfg = EnvConfig(
-        n_envs=1,
-        randomize=False,           # 标称环境，关 DR
-        obs_noise_scale=0.0,       # 关观测噪声
-        obs_delay_steps=0,         # 关延迟
+        dr_enabled=False,          # 标称环境，关 DR
     )
-    env = DogEnvMJX(env_cfg)
-    print(f"env: n_envs=1, DR=关, noise=0, delay=0")
+    env = DogEnvMJX(n_envs=1, config=env_cfg)
+    print(f"env: n_envs=1, DR=关, model={env.cfg.action_scale}")
 
     # --- Actor ---
     actor = make_teacher_actor(action_dim=12)
