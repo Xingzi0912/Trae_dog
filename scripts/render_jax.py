@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="logs/dog_walk",
                     help="视频输出路径（不含扩展名，自动 .mp4 或 .gif）")
+    ap.add_argument("--video", action="store_true", default=True,
+                    help="离屏渲染（默认开启；保留此参数仅为兼容旧命令行）")
     args = ap.parse_args()
 
     # --- checkpoint ---
