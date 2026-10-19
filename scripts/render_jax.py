@@ -44,7 +44,9 @@ from algos.networks_jax import make_teacher_actor
 
 
 def load_ckpt(ckpt_path: str):
-    """返回 (actor_params, obs_rms_dict)；obs_rms_dict 可能为 None（学生没有）"""
+    """返回 (actor_params, obs_rms)；obs_rms 是 RunningMeanStd NamedTuple（或 None）"""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     with open(ckpt_path, "rb") as f:
         ck = pickle.load(f)
     return ck["params"], ck.get("obs_rms")
@@ -54,8 +56,8 @@ def make_deterministic_actor_apply(actor):
     """JIT 编译一个只返回 μ 的前向（忽略 log_std、critic）"""
 
     @jax.jit
-    def apply(params, obs):
-        mu, _std = actor.apply(params, obs)
+    def apply(actor_params, obs):
+        mu, _std = actor.apply(actor_params, obs)
         return mu
 
     return apply
@@ -74,12 +76,13 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
     """
     import glfw
 
-    mj_model = mujoco.MjModel.from_xml_path(env.model_xml)
+    scene_xml = str(Path(__file__).parent.parent / "envs" / "scene_mjx.xml")
+    mj_model = mujoco.MjModel.from_xml_path(scene_xml)
     mjx_model = mjx.put_model(mj_model)
 
     if obs_rms_dict is not None:
-        obs_mean = jnp.asarray(obs_rms_dict["mean"])
-        obs_var = jnp.asarray(obs_rms_dict["var"])
+        obs_mean = jnp.asarray(obs_rms_dict.mean)
+        obs_var = jnp.asarray(obs_rms_dict.var)
     else:
         obs_mean = jnp.zeros(99)
         obs_var = jnp.ones(99)
@@ -138,17 +141,22 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
         while not glfw.window_should_close(win):
             glfw.poll_events()
 
+            # 拼特权信息 (61+38=99)
+            priv = env.get_privileged_obs(state)  # (1, 38)
+            teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+            # 覆盖指令槽（[58:61] 是标准 obs 里的指令，[99-3=96:99] 也是，两处都改）
             cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
-            obs_mod = obs.at[0, 58:61].set(cmd_arr[0])
-            obs_n = (obs_mod - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-            action = jnp.clip(actor_apply(params["actor"]["params"], obs_n), -1.0, 1.0)
+            teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
+            teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
+            obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+            action = jnp.clip(actor_apply(params["actor"], obs_n), -1.0, 1.0)
 
             state, obs, reward, term, trunc, info = single_step(state, action)
             if bool(term[0]) or bool(trunc[0]):
                 rng, k2 = jax.random.split(rng)
                 state, obs = env.reset(k2)
 
-            mj_data = mjx.get_data(mj_model, state.mjx_data)
+            mj_data = mjx.get_data(mj_model, state.dx)[0]
             cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
             renderer.update_scene(mj_data, camera=cam)
             renderer.render()
@@ -179,7 +187,8 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         print("  未发现 imageio-ffmpeg，将输出 gif")
 
     # --- MuJoCo 渲染器 ---
-    mj_model = mujoco.MjModel.from_xml_path(env.model_xml)
+    scene_xml = str(Path(__file__).parent.parent / "envs" / "scene_mjx.xml")
+    mj_model = mujoco.MjModel.from_xml_path(scene_xml)
     renderer = mujoco.Renderer(mj_model, height=480, width=640)
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -199,8 +208,8 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
 
     # --- obs 归一化 ---
     if obs_rms_dict is not None:
-        obs_mean = jnp.asarray(obs_rms_dict["mean"])
-        obs_var = jnp.asarray(obs_rms_dict["var"])
+        obs_mean = jnp.asarray(obs_rms_dict.mean)
+        obs_var = jnp.asarray(obs_rms_dict.var)
     else:
         obs_mean = jnp.zeros_like(obs[0])
         obs_var = jnp.ones_like(obs[0])
@@ -213,16 +222,18 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
     done = False
 
     for step in range(1, n_steps + 1):
-        # 归一化（99 维）→ Actor μ → clip
-        obs_n = (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-        mu = actor_apply(params["actor"]["params"], obs_n)  # (1, 12)
+        # 拼特权 → 99 维 → 归一化 → Actor
+        priv = env.get_privileged_obs(state)
+        teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+        obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+        mu = actor_apply(params["actor"], obs_n)  # (1, 12)
         action = jnp.clip(mu, -1.0, 1.0)
 
         state, obs, reward, term, trunc, info = single_step(state, action)
         total_reward += float(reward[0])
 
         # MJX state → mujoco data → render
-        mj_data = mjx.get_data(mj_model, state.mjx_data)
+        mj_data = mjx.get_data(mj_model, state.dx)[0]
         cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
         renderer.update_scene(mj_data, camera=cam)
         frames.append(renderer.render())
@@ -254,7 +265,7 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
     plt.close(fig)
 
     # --- 总结 ---
-    mj_data = mjx.get_data(mj_model, state.mjx_data)
+    mj_data = mjx.get_data(mj_model, state.dx)[0]
     x, y = float(mj_data.qpos[0]), float(mj_data.qpos[1])
     print()
     print(f"  视频已保存: {out}（{len(frames)} 帧）")
