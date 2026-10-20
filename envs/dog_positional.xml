@@ -153,21 +153,21 @@
   <!-- ctrlrange 取关节角限位（autolimits=true 也已继承，显式写出更清晰） -->
   <!-- 顺序：[FL, FR, RL, RR] × [hip, thigh, calf]，与 q_default 一致 -->
   <actuator>
-    <position name="FL_hip"    joint="FL_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="FL_thigh"  joint="FL_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="FL_calf"   joint="FL_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="FL_hip"    joint="FL_hip_joint"    kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1 1"/>
+    <position name="FL_thigh"  joint="FL_thigh_joint"  kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1.5 3"/>
+    <position name="FL_calf"   joint="FL_calf_joint"   kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-2.5 -0.85"/>
 
-    <position name="FR_hip"    joint="FR_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="FR_thigh"  joint="FR_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="FR_calf"   joint="FR_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="FR_hip"    joint="FR_hip_joint"    kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1 1"/>
+    <position name="FR_thigh"  joint="FR_thigh_joint"  kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1.5 3"/>
+    <position name="FR_calf"   joint="FR_calf_joint"   kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-2.5 -0.85"/>
 
-    <position name="RL_hip"    joint="RL_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="RL_thigh"  joint="RL_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="RL_calf"   joint="RL_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="RL_hip"    joint="RL_hip_joint"    kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1 1"/>
+    <position name="RL_thigh"  joint="RL_thigh_joint"  kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1.5 3"/>
+    <position name="RL_calf"   joint="RL_calf_joint"   kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-2.5 -0.85"/>
 
-    <position name="RR_hip"    joint="RR_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="RR_thigh"  joint="RR_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="RR_calf"   joint="RR_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="RR_hip"    joint="RR_hip_joint"    kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1 1"/>
+    <position name="RR_thigh"  joint="RR_thigh_joint"  kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-1.5 3"/>
+    <position name="RR_calf"   joint="RR_calf_joint"   kp="60" kv="2" ctrllimited="true" forcelimited="true" forcerange="-40 40" ctrlrange="-2.5 -0.85"/>
   </actuator>
 
   <sensor>

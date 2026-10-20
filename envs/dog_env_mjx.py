@@ -529,9 +529,13 @@ class DogEnvMJX:
         ctrl = buf[2 - state.delay]
 
         # 10 个物理子步 = 1 个策略步（无中途塌倒早停，见模块 docstring）
+        # v21：qvel 数值护栏。每个物理子步后 clamp（±100），极端接触/别腿时
+        # 阻止速度发散滚雪球成 inf/NaN；正常步态 |qvel|<30，护栏隐身。
+        def _substep(d, _):
+            d = mjx.step(mx, d)
+            return d.replace(qvel=jnp.clip(d.qvel, -100.0, 100.0)), None
         dx = state.dx.replace(ctrl=ctrl)
-        dx = jax.lax.scan(lambda d, _: (mjx.step(mx, d), None),
-                          dx, None, length=cfg.frame_skip)[0]
+        dx = jax.lax.scan(_substep, dx, None, length=cfg.frame_skip)[0]
 
         # 运动学（观测/奖励共用）
         R = _quat_to_mat(dx.qpos[3:7])

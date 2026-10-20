@@ -313,13 +313,21 @@ def make_update(env, config: PPOConfig, tx):
             log_prob = gaussian_log_prob(raw_action, mu, std)
             action = jnp.clip(raw_action, -1.0, 1.0)
             st, obs, rew, term, trunc, info = env.step(st, action, mx_model)
-            done = jnp.logical_or(term, trunc)
+            # v21：物理发散隔离（第三层兜底）。单 env rew/obs 非有限 → 视为
+            # done 提前 reset（st/tobs 由下方 tree_where_done 换 fresh），
+            # rew/tobs_new/rterms 屏蔽，避免 1 个 env 的 NaN 污染 2048 路均值。
+            finite_env = jnp.isfinite(rew) & jnp.all(jnp.isfinite(obs), axis=-1)
+            done = jnp.logical_or(term, trunc) | (~finite_env)
+            rew = jnp.where(finite_env, rew, jnp.float32(0.0))
             tobs_new = make_teacher_obs(obs, info["privileged_obs"])
+            tobs_new = jnp.where(finite_env[:, None], tobs_new, jnp.float32(0.0))
+            _sf = lambda x: jnp.where(finite_env, x, jnp.float32(0.0))
             # 奖励分项：7 项各自对 N 个 env 求均值 → (7,)，供日志归因
             # （顺序 track/yaw/upright/energy/jerk/vz/rp，sum 应等于 reward）
             rterms = jnp.mean(jnp.stack(
-                [info["r_track"], info["r_yaw"], info["r_upright"],
-                 info["r_energy"], info["r_jerk"], info["r_vz"], info["r_rp"]],
+                [_sf(info["r_track"]), _sf(info["r_yaw"]), _sf(info["r_upright"]),
+                 _sf(info["r_energy"]), _sf(info["r_jerk"]), _sf(info["r_vz"]),
+                 _sf(info["r_rp"])],
                 axis=-1), axis=0)
             # ← 关键优化：从 carry 取预计算的 fresh，不再每步完整 reset 2048 env
             st = tree_where_done(done, fresh_st, st)
