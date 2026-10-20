@@ -649,15 +649,22 @@ def train(rng, env, config: PPOConfig,
             **m_ep_arr,
         }
 
-        # -- NaN 检查 --
-        has_nan = any(not jnp.isfinite(jnp.float32(float(v)))
-                      for v in [m["reward"], float(m["kl"].mean()),
-                                float(m["entropy"].mean()),
-                                float(m["value_loss"].mean()),
-                                float(m["policy_loss"].mean())])
-        if has_nan:
+        # -- NaN 检查：定位是哪个指标 + 崩溃现场快照 --
+        probe = {"reward": m["reward"], "kl": m["kl"], "entropy": m["entropy"],
+                 "value_loss": m["value_loss"], "policy_loss": m["policy_loss"]}
+        p_arr = {k: jax.device_get(jnp.asarray(v, jnp.float32))
+                 for k, v in probe.items()}
+        bad = [k for k, v in p_arr.items()
+               if not bool(jnp.all(jnp.isfinite(v)))]
+        if bad:
+            snap = {k: (float(jnp.nanmean(v))
+                        if bool(jnp.any(jnp.isfinite(v))) else float("nan"))
+                    for k, v in p_arr.items()}
             raise RuntimeError(
-                f"update {update}: metrics 含 NaN/inf")
+                f"update {update}: NaN/inf 指标={bad}; 各指标均值={snap}; "
+                f"adv_p99={m['adv_p99']:.3f} vmean={m['vmean']:.3f} "
+                f"vmin={m['vmin']:.1f} vmax={m['vmax']:.1f} "
+                f"kl_max={float(jnp.nanmax(jnp.asarray(m['kl_max'], jnp.float32))):.3f}")
 
         # -- 逐 epoch 指标 --
         n_active = max(1, int(m["active"].sum()))
