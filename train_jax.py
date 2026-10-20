@@ -135,10 +135,10 @@ def main():
                         help="PPO 每 update 的 epoch 数（legged_gym 默认 5）")
     parser.add_argument("--n_minibatches", type=int, default=4,
                         help="每个 epoch 的 minibatch 数（legged_gym 默认 4）")
-    parser.add_argument("--lr", type=float, default=1e-5,
-                        help="固定学习率（v17 起 1e-5：Adam 饱和区单步步长≈lr，"
-                             "KL/步 ∝ lr²，5e-5→1e-5 把每步 KL 压 25 倍；"
-                             "v13-v16 证明 μ 是乱跳而非学不动，崩着快不如稳着慢）")
+    parser.add_argument("--lr", type=float, default=2.5e-4,
+                        help="固定学习率（v19 回 PureJaxRL 标准 2.5e-4：μ 头增益"
+                             " 38×→1× 后等效操作点归位；v17 的 1e-5 是在错误"
+                             "增益下压每步 KL 的代偿，与增益同属一个耦合变量）")
     parser.add_argument("--distill_steps", type=int, default=None,
                         help="蒸馏总步数（默认=教师 1/4）")
     parser.add_argument("--no_residual", action="store_true",

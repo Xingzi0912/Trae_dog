@@ -42,7 +42,13 @@ class Actor(nn.Module):
         a = nn.relu(a)
         a = nn.Dense(self.hidden)(a)
         a = nn.relu(a)
-        mu = nn.Dense(self.action_dim)(a)
+        # v19：μ 头对齐 PureJaxRL 演员头 orthogonal(0.01)。Flax 默认
+        # lecun_normal 行范数≈1，μ 敏感度实测高 38×；KL/步 ∝ (lr×增益)²，
+        # v15 爆炸（等效 PJRL lr 1.9e-3）、v17/v18 饥饿（等效 3.8e-4）、
+        # clip[A] 起始 11.9% 与 μ 外漂 NaN，同此一因。
+        mu = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.orthogonal(0.01))(a)
 
         # 全局 log_std（状态无关）
         # 必须用**强类型**常量初始化：jnp.full / jnp.zeros / jnp.ones 产出的是弱类型
