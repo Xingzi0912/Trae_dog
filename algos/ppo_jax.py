@@ -303,10 +303,15 @@ def make_update(env, config: PPOConfig, tx):
             mu, std = actor.apply(params["actor"], tobs_n)
             value = critic.apply(params["critic"], tobs_n)
             k, k_act = jax.random.split(k)
-            action = mu + std * jax.random.normal(k_act, mu.shape)
-            n_clipped = jnp.sum(jnp.abs(action) > 0.999)
-            action = jnp.clip(action, -1.0, 1.0)
-            log_prob = gaussian_log_prob(action, mu, std)
+            raw_action = mu + std * jax.random.normal(k_act, mu.shape)
+            n_clipped = jnp.sum(jnp.abs(raw_action) > 0.999)
+            # v20：logp 与 act_arr 一律用 raw 动作；clip 只作用于进 env 的
+            # 动作（对齐 spinningup 等主流实现）。v19 暴露了旧写法的边界
+            # 自激：概率质量压在恰好 ±1.0 上，边界样本的 (a-μ)/σ² 杠杆与
+            # ratio 尾部全分布最大，adv 为正时把 μ 超线性往外拽（u27 起
+            # clip[A] +3%/update、KL 尖峰 1.07）。
+            log_prob = gaussian_log_prob(raw_action, mu, std)
+            action = jnp.clip(raw_action, -1.0, 1.0)
             st, obs, rew, term, trunc, info = env.step(st, action, mx_model)
             done = jnp.logical_or(term, trunc)
             tobs_new = make_teacher_obs(obs, info["privileged_obs"])
@@ -319,7 +324,7 @@ def make_update(env, config: PPOConfig, tx):
             # ← 关键优化：从 carry 取预计算的 fresh，不再每步完整 reset 2048 env
             st = tree_where_done(done, fresh_st, st)
             tobs_out = tree_where_done(done, fresh_tobs, tobs_new)
-            out = (tobs_n, action, log_prob, value, rew, done, tobs_new, rterms)
+            out = (tobs_n, raw_action, log_prob, value, rew, done, tobs_new, rterms)
             return (st, tobs_out, k, act_clip_cnt + n_clipped), out
 
         carry_init = (state, teacher_obs, rng, jnp.float32(0))
