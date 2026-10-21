@@ -89,7 +89,12 @@ class PPOConfig:
     # 严格同步的变量；钉 0.5 后 kl_scale_std 阈值恒定
     # 0.1×(0.5/0.607)≈0.082。若中途 kl 再加速则 v16 = n_minibatches 4→32。
     std_start: float = 0.5
-    std_end: float = 0.5
+    # v22：σ 退火重启 0.5→0.35（u51-u84 横盘实锤：track 0.438→0.377）。
+    # σ=0.5 时噪声税 r_energy≈-0.15、μ RMS≈0.34<σ 信噪比<1，是结构性瓶颈；
+    # v18 闸门+v19 初始化+v20 logp 修复后 kl 余量充足（0.01~0.02），v15 钉 σ
+    # 的两个理由（KL 不稳、边界自激）均已不存在。风险：σ↓→per-step KL∝1/σ²
+    # 增 ~2×，kl_lim 随 σ 缩至 ~0.07；kl 若持续 >0.05 则回退本值。
+    std_end: float = 0.35
     # 退火覆盖的 update 数（之后保持 std_end）；0 或 <0 表示铺满整个 run
     std_anneal_updates: int = 120
     # 训练
