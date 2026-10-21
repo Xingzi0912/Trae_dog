@@ -533,9 +533,14 @@ class DogEnvMJX:
         # 阻止速度发散滚雪球成 inf/NaN；正常步态 |qvel|<30，护栏隐身。
         def _substep(d, _):
             d = mjx.step(mx, d)
-            return d.replace(qvel=jnp.clip(d.qvel, -100.0, 100.0)), None
+            # v21b：护栏触火取证——任何分量触及 ±100 记一次（NaN 比较恒为
+            # False，不会误计）。触火率与 alive 下探同频 = 接触爆炸实锤。
+            fired = jnp.any(jnp.abs(d.qvel) >= 100.0)
+            return d.replace(qvel=jnp.clip(d.qvel, -100.0, 100.0)), fired
         dx = state.dx.replace(ctrl=ctrl)
-        dx = jax.lax.scan(_substep, dx, None, length=cfg.frame_skip)[0]
+        dx, fired_arr = jax.lax.scan(_substep, dx, None,
+                                     length=cfg.frame_skip)
+        qvel_fire_cnt = jnp.sum(fired_arr.astype(jnp.float32))
 
         # 运动学（观测/奖励共用）
         R = _quat_to_mat(dx.qpos[3:7])
@@ -586,6 +591,7 @@ class DogEnvMJX:
             "lin_vel_b": lin_b, "ang_vel_b": ang_b, "command": cmd,
             "r_track": r_track, "r_yaw": r_yaw, "r_upright": r_upright,
             "r_energy": r_energy, "r_jerk": r_jerk, "r_vz": r_vz, "r_rp": r_rp,
+            "qvel_fire_cnt": qvel_fire_cnt,
             "privileged_obs": priv,
         }
         return new_state, obs, reward, terminated, truncated, info

@@ -332,7 +332,11 @@ def make_update(env, config: PPOConfig, tx):
             # ← 关键优化：从 carry 取预计算的 fresh，不再每步完整 reset 2048 env
             st = tree_where_done(done, fresh_st, st)
             tobs_out = tree_where_done(done, fresh_tobs, tobs_new)
-            out = (tobs_n, raw_action, log_prob, value, rew, done, tobs_new, rterms)
+            # v21b：本策略步内护栏触火的 env 占比（接触爆炸未遂率）
+            fire_rate = jnp.mean(
+                (info["qvel_fire_cnt"] > 0).astype(jnp.float32))
+            out = (tobs_n, raw_action, log_prob, value, rew, done, tobs_new,
+                   rterms, fire_rate)
             return (st, tobs_out, k, act_clip_cnt + n_clipped), out
 
         carry_init = (state, teacher_obs, rng, jnp.float32(0))
@@ -340,13 +344,13 @@ def make_update(env, config: PPOConfig, tx):
                                      length=rollout_len)
         (state, teacher_obs, rng, act_clip_total) = carry_end
         (obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
-         rterms_arr) = ro
+         rterms_arr, fire_arr) = ro
         n_action_elts = rollout_len * config.n_envs * act_arr.shape[-1]
         action_clip_pct = act_clip_total / jnp.float32(n_action_elts)
         alive_pct = 1.0 - done_arr.mean()
         return state, teacher_obs, rng, (
             obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
-            rterms_arr, action_clip_pct, alive_pct)
+            rterms_arr, action_clip_pct, alive_pct, fire_arr)
 
     # ------------------------------------------------------------------
     # Part 2: JIT GAE + obs_rms 更新
@@ -617,7 +621,7 @@ def train(rng, env, config: PPOConfig,
             obs_rms.mean, obs_rms.var, mx_model,
             fresh_st, fresh_tobs)
         obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr, \
-            rterms_arr, action_clip_pct, alive_pct = ro
+            rterms_arr, action_clip_pct, alive_pct, fire_arr = ro
 
         # ==============================================================
         # [阶段 2] GAE + RMS
@@ -656,6 +660,7 @@ def train(rng, env, config: PPOConfig,
             "vmean": vmean, "vmin": vmin, "vmax": vmax,
             "action_clip_pct": float(jax.device_get(action_clip_pct)),
             "alive_pct": float(jax.device_get(alive_pct)),
+            "qvel_fire": float(jax.device_get(fire_arr.mean())),
             # 奖励分项：整条 rollout 的 T×N 均值，(7,) 顺序
             # track/yaw/upright/energy/jerk/vz/rp
             "rterms": jax.device_get(rterms_arr.mean(axis=0)),
@@ -727,7 +732,8 @@ def train(rng, env, config: PPOConfig,
                 f"kl_ovr={kl_overshoot*100:.0f}%, ep={idx}/{config.n_epochs - 1}, "
                 f"clip[R={ratio_clip*100:.0f}% V={value_clip*100:.0f}% A={float(m['action_clip_pct'])*100:.1f}%], "
                 f"finite={finite_min*100:.0f}%, "
-                f"alive={float(m['alive_pct'])*100:.1f}%")
+                f"alive={float(m['alive_pct'])*100:.1f}%, "
+                f"fire={float(m['qvel_fire'])*100:.2f}%")
             # —— 奖励归因：7 项分项均值（sum 应与上面的 reward 相等）——
             rt = [float(v) for v in m["rterms"]]
             log_fn(f"      └ 奖励分项 track={rt[0]:.3f} yaw={rt[1]:.3f} "
