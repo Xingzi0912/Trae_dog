@@ -303,9 +303,10 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
         # --- Actor step ---
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+        # 覆盖指令位：仅 obs[58:61]；priv(38 维) 不含指令副本，
+        # 误写 96:99 会覆盖 质量乘子/base_x/base_y（2026-10-22 实锤 bug）
         cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
-        teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
         action = jnp.clip(actor_apply(params["actor"], obs_n), -1.0, 1.0)
 
@@ -400,10 +401,10 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
-        # 覆盖指令位（与交互模式一致：58:61 标准观测，96:99 特权副本）
+        # 覆盖指令位：仅 obs[58:61]；priv 无指令副本，勿动 96:99
+        # （那是 质量乘子/base_x/base_y，写错会导致 OOD 漂移/摔倒）
         cmd_arr = jnp.array([current_cmd], dtype=jnp.float32)
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
-        teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
 
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
         mu = actor_apply(params["actor"], obs_n)  # (1, 12)
