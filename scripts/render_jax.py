@@ -49,6 +49,154 @@ from envs.dog_env_mjx import DogEnvMJX, EnvConfig
 from algos.networks_jax import make_teacher_actor
 
 
+# ---------------------------------------------------------------------------
+# 指令调度与可视化辅助
+# ---------------------------------------------------------------------------
+
+def parse_cmd_schedule(s: str):
+    """解析 "step:vx,vy,yaw; step:vx,vy,yaw; ..." 为 [(step, (vx,vy,yaw)), ...]"""
+    if not s:
+        return []
+    out = []
+    for part in s.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        t_str, cmd_str = part.split(":")
+        t = int(t_str.strip())
+        vx, vy, yaw = [float(x) for x in cmd_str.split(",")]
+        out.append((t, (vx, vy, yaw)))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def get_cmd_at_step(schedule, step, default=(0.0, 0.0, 0.0)):
+    """根据调度表返回当前指令；无匹配则返回 default"""
+    cmd = default
+    for t, c in schedule:
+        if step >= t:
+            cmd = c
+        else:
+            break
+    return cmd
+
+
+def _arrow_geom_type():
+    """mjGEOM_ARROW 在 MuJoCo 3.0+ 可用，旧版本 fallback 到 CYLINDER"""
+    try:
+        return mujoco.mjtGeom.mjGEOM_ARROW
+    except AttributeError:
+        return mujoco.mjtGeom.mjGEOM_CYLINDER
+
+
+def add_cmd_arrow(renderer, base_pos, vx, vy, yaw):
+    """向 renderer.scene 追加 3D 箭头 geom，表示速度指令方向（狗头顶上方）"""
+    scn = renderer.scene
+    if scn.ngeom >= scn.maxgeom - 1:
+        return
+
+    speed = np.sqrt(vx**2 + vy**2)
+    # 箭头长度：0.15 ~ 0.5m，对应速度 0 ~ 1.5 m/s
+    arrow_len = 0.15 + min(speed / 1.5, 1.0) * 0.35
+
+    g = scn.geoms[scn.ngeom]
+    pos = np.array([base_pos[0], base_pos[1], base_pos[2] + 0.5])
+
+    if speed > 0.01:
+        # 方向：水平指向 (vx, vy)
+        dir_vec = np.array([vx, vy, 0.0])
+        dir_vec = dir_vec / (np.linalg.norm(dir_vec) + 1e-8)
+
+        # 构造旋转矩阵：局部 +z 指向 dir_vec
+        z_axis = dir_vec
+        x_axis = np.cross([0, 0, 1], z_axis)
+        if np.linalg.norm(x_axis) < 1e-6:
+            x_axis = np.array([1.0, 0, 0])
+        else:
+            x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        mat = np.array([x_axis, y_axis, z_axis]).T.flatten()  # row-major
+
+        g.type = _arrow_geom_type()
+        g.pos[:] = pos
+        g.mat[:] = mat
+        g.size[0] = 0.03          # width / radius
+        g.size[1] = arrow_len     # length
+        g.size[2] = 0.0
+        g.rgba[:] = [0.0, 1.0, 0.0, 1.0]   # 绿色
+    else:
+        # 零速：灰色小圆点
+        g.type = mujoco.mjtGeom.mjGEOM_SPHERE
+        g.pos[:] = pos
+        g.mat[:] = np.eye(3).flatten()
+        g.size[0] = 0.05
+        g.size[1] = 0.0
+        g.size[2] = 0.0
+        g.rgba[:] = [0.5, 0.5, 0.5, 0.8]
+
+    # 清空可能干扰的字段
+    g.dataid = -1
+    g.objtype = 0
+    g.objid = -1
+    g.category = 0
+    g.texid = -1
+    g.emission = 0.0
+    g.specular = 0.5
+    g.shininess = 0.5
+    g.reflectance = 0.0
+    g.label = b""
+    scn.ngeom += 1
+
+
+def draw_cmd_hud(frame, cmd):
+    """用 PIL 在帧左上角画指令 HUD（速度向量圆盘 + 数值）"""
+    from PIL import Image, ImageDraw
+
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    vx, vy, yaw = cmd
+
+    # 半透明黑底面板
+    hud_x, hud_y = 10, 10
+    hud_w, hud_h = 160, 120
+    draw.rectangle(
+        [hud_x, hud_y, hud_x + hud_w, hud_y + hud_h],
+        fill=(0, 0, 0, 180),
+        outline=(0, 255, 0, 255),
+        width=1,
+    )
+
+    # 标题
+    draw.text((hud_x + 5, hud_y + 5), "CMD", fill=(0, 255, 0))
+
+    # 速度向量小圆盘
+    cx, cy = hud_x + 80, hud_y + 55
+    r = 30
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(100, 100, 100), width=1)
+    draw.line([cx - r, cy, cx + r, cy], fill=(80, 80, 80), width=1)
+    draw.line([cx, cy - r, cx, cy + r], fill=(80, 80, 80), width=1)
+
+    speed = np.sqrt(vx**2 + vy**2)
+    if speed > 0.01:
+        max_s = 1.5
+        scale = min(speed / max_s, 1.0) * (r - 3)
+        angle = np.arctan2(vy, vx)
+        ex = cx + scale * np.cos(angle)
+        ey = cy - scale * np.sin(angle)  # PIL y 向下
+        draw.line([cx, cy, ex, ey], fill=(0, 255, 0), width=2)
+        draw.ellipse([ex - 2, ey - 2, ex + 2, ey + 2], fill=(0, 255, 0))
+
+    # 数值
+    draw.text(
+        (hud_x + 5, hud_y + 95),
+        f"vx:{vx:+.2f} vy:{vy:+.2f} yaw:{yaw:+.2f}",
+        fill=(255, 255, 255),
+    )
+
+    return np.array(img)
+
+
 def load_ckpt(ckpt_path: str):
     """返回 (actor_params, obs_rms)；obs_rms 是 RunningMeanStd NamedTuple（或 None）"""
     import sys
@@ -189,7 +337,8 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
 
 
 def run_offscreen(env, actor_apply, params, obs_rms_dict,
-                  n_steps: int, out_path: Path, seed: int = 0):
+                  n_steps: int, out_path: Path, seed: int = 0,
+                  cmd_schedule=None):
     """离屏渲染，matplotlib 存 mp4 或 gif"""
     import matplotlib
     matplotlib.use("Agg")
@@ -237,11 +386,22 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
     total_reward = 0.0
     step = 0
     done = False
+    current_cmd = (0.0, 0.0, 0.0)
 
     for step in range(1, n_steps + 1):
+        # 指令调度
+        if cmd_schedule:
+            current_cmd = get_cmd_at_step(cmd_schedule, step)
+
         # 拼特权 → 99 维 → 归一化 → Actor
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+
+        # 覆盖指令位（与交互模式一致：58:61 标准观测，96:99 特权副本）
+        cmd_arr = jnp.array([current_cmd], dtype=jnp.float32)
+        teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
+        teacher_obs = teacher_obs.at[0, 96:99].set(cmd_arr[0])
+
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
         mu = actor_apply(params["actor"], obs_n)  # (1, 12)
         action = jnp.clip(mu, -1.0, 1.0)
@@ -253,7 +413,15 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         mj_data = mjx.get_data(mj_model, state.dx)[0]
         cam.lookat[:] = [mj_data.qpos[0], mj_data.qpos[1], 0.25]
         renderer.update_scene(mj_data, camera=cam)
-        frames.append(renderer.render())
+
+        # 3D 箭头：狗头顶显示当前指令方向
+        add_cmd_arrow(renderer, mj_data.qpos[0:3], *current_cmd)
+
+        rgb = renderer.render()
+
+        # 2D HUD：左上角数值面板
+        rgb = draw_cmd_hud(rgb, current_cmd)
+        frames.append(rgb)
 
         if bool(term[0]) or bool(trunc[0]):
             print(f"  提前结束 at step {step}（term={bool(term[0])}, trunc={bool(trunc[0])}）")
@@ -303,10 +471,17 @@ def main():
                     help="键盘控制模式（WASD/Q/E 改指令，需本地 pygame + 显示器）")
     ap.add_argument("--video", action="store_true", default=False,
                     help="离屏视频模式（默认）")
+    ap.add_argument("--cmds", type=str, default="",
+                    help='指令调度 "step:vx,vy,yaw; step:vx,vy,yaw; ..."，'
+                         '例：--cmds "0:0,0,0; 200:1.0,0,0; 500:0,0.4,0"')
     args = ap.parse_args()
 
     if not args.interactive and not args.video:
         args.video = True  # 默认视频模式
+
+    cmd_schedule = parse_cmd_schedule(args.cmds)
+    if cmd_schedule:
+        print(f"指令调度: {cmd_schedule}")
 
     # --- checkpoint ---
     ckpt_path = Path(args.ckpt)
@@ -345,7 +520,7 @@ def main():
     else:
         print("模式: 离屏视频（--video）")
         run_offscreen(env, actor_apply, params, obs_rms_dict,
-                      args.steps, out_path, args.seed)
+                      args.steps, out_path, args.seed, cmd_schedule=cmd_schedule)
 
 
 if __name__ == "__main__":
