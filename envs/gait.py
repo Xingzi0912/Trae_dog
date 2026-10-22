@@ -44,6 +44,9 @@ A_CALF = 0.35
 FREQ_MIN = 2.0
 FREQ_MAX = 4.0
 
+# thigh-calf 相位差（rad），v24 探针扫描选定；π = 旧版反相（实测净推进 -x）
+GAIT_DELTA = float(np.pi / 2)
+
 
 def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     """生成基准 trot 步态
@@ -77,10 +80,6 @@ def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     # yaw 影响左右腿 hip 差（转向时内外侧步幅不同）
     yaw_hip = A_HIP * 0.5 * jnp.clip(yaw / 2.0, -1.0, 1.0)
 
-    # 方向系数（v24）：dir=-1 → thigh=-sin（净推进 +x，探针旧版 +sin 朝 -x）；
-    # vx<0 → dir=+1（旧相位，净推进 -x = 后退）
-    direction = jnp.where(vx >= 0.0, -1.0, 1.0)
-
     # hip: vy 正向左移 → 左腿外展(hip+)，右腿内收(hip-)
     hip_sign = jnp.sign(vy + 1e-8)
     fl_hip = amp_hip * hip_sign + yaw_hip
@@ -88,16 +87,22 @@ def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     rl_hip = amp_hip * hip_sign - yaw_hip
     rr_hip = -amp_hip * hip_sign + yaw_hip
 
-    # thigh/calf：整体方向翻转，两者保持 π 反相（屈膝配合不变）
-    fl_thigh = direction * amp_thigh * jnp.sin(phase_a)
-    fr_thigh = direction * amp_thigh * jnp.sin(phase_b)
-    rl_thigh = direction * amp_thigh * jnp.sin(phase_b)
-    rr_thigh = direction * amp_thigh * jnp.sin(phase_a)
+    # thigh/calf 相位差 δ 参数化（v24 判决修正）：
+    # 净推进方向由 thigh-calf 相位关系决定。旧版反相 δ=π 实测净推进 -x；
+    # 同相 δ=0 轨道退化（直线），方向翻转失效。故引入 GAIT_DELTA，
+    # 前进=+δ、后退=-δ（镜像轨道 = 真时间反演），δ 值由探针扫描实测选定。
+    direction = jnp.where(vx >= 0.0, 1.0, -1.0)
+    delta = direction * GAIT_DELTA
 
-    fl_calf = -direction * amp_calf * jnp.sin(phase_a)
-    fr_calf = -direction * amp_calf * jnp.sin(phase_b)
-    rl_calf = -direction * amp_calf * jnp.sin(phase_b)
-    rr_calf = -direction * amp_calf * jnp.sin(phase_a)
+    fl_thigh = amp_thigh * jnp.sin(phase_a)
+    fr_thigh = amp_thigh * jnp.sin(phase_b)
+    rl_thigh = amp_thigh * jnp.sin(phase_b)
+    rr_thigh = amp_thigh * jnp.sin(phase_a)
+
+    fl_calf = amp_calf * jnp.sin(phase_a + delta)
+    fr_calf = amp_calf * jnp.sin(phase_b + delta)
+    rl_calf = amp_calf * jnp.sin(phase_b + delta)
+    rr_calf = amp_calf * jnp.sin(phase_a + delta)
 
     gait_q = jnp.stack([
         fl_hip, fl_thigh, fl_calf,   # FL
