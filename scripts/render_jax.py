@@ -311,7 +311,7 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
         # --- Actor step ---
         # 强制 env 内部指令 = 键盘指令（残差步态基准由 state.command 驱动）
         cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
-        state = state.replace(command=cmd_arr)
+        state = state._replace(command=cmd_arr)
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
         # 覆盖指令位：仅 obs[58:61]；priv(38 维) 不含指令副本，
@@ -412,7 +412,7 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         # 强制 env 内部指令 = 调度指令（残差步态的基准由它驱动；
         # 训练时 obs 指令与内部 command 天然一致，渲染必须手动对齐）
         cmd_arr = jnp.array([current_cmd], dtype=jnp.float32)
-        state = state.replace(command=cmd_arr)
+        state = state._replace(command=cmd_arr)
 
         # 拼特权 → 99 维 → 归一化 → Actor
         priv = env.get_privileged_obs(state)
