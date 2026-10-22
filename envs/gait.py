@@ -44,8 +44,11 @@ A_CALF = 0.35
 FREQ_MIN = 2.0
 FREQ_MAX = 4.0
 
-# thigh-calf 相位差（rad），v24 探针扫描选定；π = 旧版反相（实测净推进 -x）
-GAIT_DELTA = float(np.pi / 2)
+# thigh-calf 相位差（rad），v24 探针扫描选定（/tmp/probe_gait2.py）：
+# δ=0 → +1.0m/200步（前进，存活）；δ=π → -4.5m/200步（后退，存活）；
+# δ∈{π/4, π/2, 3π/4} 全部失稳摔倒
+GAIT_DELTA_FWD = 0.0
+GAIT_DELTA_BWD = float(np.pi)
 
 
 def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
@@ -58,11 +61,11 @@ def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     Returns:
         (N, 12) 基准关节角增量（相对 q_default）
     """
-    # 频率由 vx 决定：vx ∈ [-0.5, 1.5] → freq ∈ [2, 4] Hz
+    # 频率由 |vx| 决定（v24：负 vx 也走高频，δ=π 后退构型在低频不稳）
     vx = command[..., 0]
     vy = command[..., 1]
     yaw = command[..., 2]
-    t = jnp.clip((vx + 0.5) / 2.0, 0.0, 1.0)  # 归一化到 [0,1]
+    t = jnp.clip(jnp.abs(vx) / 1.5, 0.0, 1.0)
     freq = FREQ_MIN + (FREQ_MAX - FREQ_MIN) * t
 
     # 相位
@@ -87,12 +90,11 @@ def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     rl_hip = amp_hip * hip_sign - yaw_hip
     rr_hip = -amp_hip * hip_sign + yaw_hip
 
-    # thigh/calf 相位差 δ 参数化（v24 判决修正）：
-    # 净推进方向由 thigh-calf 相位关系决定。旧版反相 δ=π 实测净推进 -x；
-    # 同相 δ=0 轨道退化（直线），方向翻转失效。故引入 GAIT_DELTA，
-    # 前进=+δ、后退=-δ（镜像轨道 = 真时间反演），δ 值由探针扫描实测选定。
-    direction = jnp.where(vx >= 0.0, 1.0, -1.0)
-    delta = direction * GAIT_DELTA
+    # thigh/calf 相位差 δ 按 vx 符号硬切换（v24 探针扫描判决）：
+    # 实测稳定极限环只有 δ=0（+1.0m/200步 前进）与 δ=π（-4.5m/200步 后退），
+    # 中间相位（π/4~3π/4）全部失稳摔倒。δ=0 轨道退化为直线、无法编码
+    # 后退方向，故后退必须切 δ=π；vx=0 时幅值=0，切换天然连续。
+    delta = jnp.where(vx >= 0.0, GAIT_DELTA_FWD, GAIT_DELTA_BWD)
 
     fl_thigh = amp_thigh * jnp.sin(phase_a)
     fr_thigh = amp_thigh * jnp.sin(phase_b)
