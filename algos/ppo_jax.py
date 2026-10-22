@@ -94,7 +94,12 @@ class PPOConfig:
     # v18 闸门+v19 初始化+v20 logp 修复后 kl 余量充足（0.01~0.02），v15 钉 σ
     # 的两个理由（KL 不稳、边界自激）均已不存在。风险：σ↓→per-step KL∝1/σ²
     # 增 ~2×，kl_lim 随 σ 缩至 ~0.07；kl 若持续 >0.05 则回退本值。
-    std_end: float = 0.35
+    # v22 判决成功：track 0.46 站稳、μ_rms 0.36→0.45、SNR 1.29，kl 余量大。
+    # v23：σ 0.35→0.30 续退火（单变量），检验 track 0.46 平台是否仍受噪声税
+    # 所限（SNR 1.29→1.50）。resume 时退火起点自动取 checkpoint 当前 σ
+    # （std_start_eff=min(std_start, 当前σ)，单调不升），120 update 线性；
+    # 预期 per-step KL ∝1/σ² 增 ~36%，0.027×1.36≈0.037 < kl_lim≈0.049，余量够。
+    std_end: float = 0.30
     # 退火覆盖的 update 数（之后保持 std_end）；0 或 <0 表示铺满整个 run
     std_anneal_updates: int = 120
     # 训练
