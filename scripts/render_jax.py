@@ -209,15 +209,23 @@ def load_ckpt(ckpt_path: str):
     return ck["params"], ck.get("obs_rms")
 
 
-def make_deterministic_actor_apply(actor):
-    """JIT 编译一个只返回 μ 的前向（忽略 log_std、critic）"""
+def make_actor_apply(actor, stochastic: bool = False):
+    """JIT 前向。stochastic=False 返回确定性 μ；True 返回 μ+σ·ε（训练同款采样）。
+    两个分支统一签名 (params, obs, key) -> (act, std)。"""
 
-    @jax.jit
-    def apply(actor_params, obs):
-        mu, _std = actor.apply(actor_params, obs)
-        return mu
-
-    return apply
+    if stochastic:
+        @jax.jit
+        def apply(actor_params, obs, key):
+            mu, std = actor.apply(actor_params, obs)
+            raw = mu + std * jax.random.normal(key, mu.shape)
+            return raw, std
+        return apply
+    else:
+        @jax.jit
+        def apply(actor_params, obs, key):
+            mu, std = actor.apply(actor_params, obs)
+            return mu, std
+        return apply
 
 
 def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
@@ -308,7 +316,9 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
         cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-        action = jnp.clip(actor_apply(params["actor"], obs_n), -1.0, 1.0)
+        rng, k_act = jax.random.split(rng)
+        act, _std = actor_apply(params["actor"], obs_n, k_act)
+        action = jnp.clip(act, -1.0, 1.0)
 
         state, obs, reward, term, trunc, info = single_step(state, action)
         if bool(term[0]) or bool(trunc[0]):
@@ -342,7 +352,7 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
 
 def run_offscreen(env, actor_apply, params, obs_rms_dict,
                   n_steps: int, out_path: Path, seed: int = 0,
-                  cmd_schedule=None):
+                  cmd_schedule=None, stochastic: bool = False):
     """离屏渲染，matplotlib 存 mp4 或 gif"""
     import matplotlib
     matplotlib.use("Agg")
@@ -407,8 +417,14 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
 
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-        mu = actor_apply(params["actor"], obs_n)  # (1, 12)
-        action = jnp.clip(mu, -1.0, 1.0)
+        rng, k_act = jax.random.split(rng)
+        act, std = actor_apply(params["actor"], obs_n, k_act)
+        action = jnp.clip(act, -1.0, 1.0)
+
+        if step % 100 == 0 or step == 1:
+            print(f"  step {step}: |mu|mean={float(jnp.abs(act).mean()):.3f} "
+                  f"mu_max={float(jnp.abs(act).max()):.3f} "
+                  f"sigma={float(std.mean()):.3f}")
 
         state, obs, reward, term, trunc, info = single_step(state, action)
         total_reward += float(reward[0])
@@ -478,6 +494,8 @@ def main():
     ap.add_argument("--cmds", type=str, default="",
                     help='指令调度 "step:vx,vy,yaw; step:vx,vy,yaw; ..."，'
                          '例：--cmds "0:0,0,0; 200:1.0,0,0; 500:0,0.4,0"')
+    ap.add_argument("--stochastic", action="store_true",
+                    help="用 μ+σ·ε 采样动作（训练 rollout 同款），对照确定性 μ")
     args = ap.parse_args()
 
     if not args.interactive and not args.video:
@@ -506,7 +524,8 @@ def main():
 
     # --- Actor ---
     actor = make_teacher_actor(action_dim=12)
-    actor_apply = make_deterministic_actor_apply(actor)
+    actor_apply = make_actor_apply(actor, stochastic=args.stochastic)
+    print(f"actor: {'随机采样 μ+σ·ε（训练同款）' if args.stochastic else '确定性 μ'}")
 
     # --- 输出路径 ---
     out_path = Path(args.out)
@@ -524,7 +543,8 @@ def main():
     else:
         print("模式: 离屏视频（--video）")
         run_offscreen(env, actor_apply, params, obs_rms_dict,
-                      args.steps, out_path, args.seed, cmd_schedule=cmd_schedule)
+                      args.steps, out_path, args.seed,
+                      cmd_schedule=cmd_schedule, stochastic=args.stochastic)
 
 
 if __name__ == "__main__":
