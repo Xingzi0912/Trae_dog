@@ -34,6 +34,9 @@ from pathlib import Path
 # 公用服务器：JAX 默认占满所有 GPU 显存，这里限制到 10%（渲染不吃 GPU，
 # 只是 MJX 仿真可能会 lazy init 一个 GPU context；给最小配额避免干扰他人）
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.10")
+# 无头服务器没有 DISPLAY：默认 glfw 需要 X11，改走 EGL 离屏渲染
+# （若 EGL 不可用再改 osmesa：MUJOCO_GL=osmesa）
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
