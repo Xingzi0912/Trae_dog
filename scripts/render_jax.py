@@ -118,7 +118,7 @@ def add_cmd_arrow(renderer, base_pos, vx, vy, yaw):
         else:
             x_axis = x_axis / np.linalg.norm(x_axis)
         y_axis = np.cross(z_axis, x_axis)
-        mat = np.array([x_axis, y_axis, z_axis]).T.flatten()  # row-major
+        mat = np.array([x_axis, y_axis, z_axis]).T  # (3,3)
 
         g.type = _arrow_geom_type()
         g.pos[:] = pos
@@ -131,7 +131,7 @@ def add_cmd_arrow(renderer, base_pos, vx, vy, yaw):
         # 零速：灰色小圆点
         g.type = mujoco.mjtGeom.mjGEOM_SPHERE
         g.pos[:] = pos
-        g.mat[:] = np.eye(3).flatten()
+        g.mat[:] = np.eye(3)
         g.size[0] = 0.05
         g.size[1] = 0.0
         g.size[2] = 0.0
