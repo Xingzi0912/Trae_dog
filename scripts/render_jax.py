@@ -309,11 +309,13 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
                 clamp_cmd()
 
         # --- Actor step ---
+        # 强制 env 内部指令 = 键盘指令（残差步态基准由 state.command 驱动）
+        cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
+        state = state.replace(command=cmd_arr)
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
         # 覆盖指令位：仅 obs[58:61]；priv(38 维) 不含指令副本，
         # 误写 96:99 会覆盖 质量乘子/base_x/base_y（2026-10-22 实锤 bug）
-        cmd_arr = jnp.array([[cmd["vx"], cmd["vy"], cmd["yaw"]]], dtype=jnp.float32)
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
         rng, k_act = jax.random.split(rng)
@@ -407,13 +409,17 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         if cmd_schedule:
             current_cmd = get_cmd_at_step(cmd_schedule, step)
 
+        # 强制 env 内部指令 = 调度指令（残差步态的基准由它驱动；
+        # 训练时 obs 指令与内部 command 天然一致，渲染必须手动对齐）
+        cmd_arr = jnp.array([current_cmd], dtype=jnp.float32)
+        state = state.replace(command=cmd_arr)
+
         # 拼特权 → 99 维 → 归一化 → Actor
         priv = env.get_privileged_obs(state)
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
         # 覆盖指令位：仅 obs[58:61]；priv 无指令副本，勿动 96:99
         # （那是 质量乘子/base_x/base_y，写错会导致 OOD 漂移/摔倒）
-        cmd_arr = jnp.array([current_cmd], dtype=jnp.float32)
         teacher_obs = teacher_obs.at[0, 58:61].set(cmd_arr[0])
 
         obs_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
@@ -516,8 +522,13 @@ def main():
     print(f"  obs_rms: {'有' if obs_rms_dict is not None else '无（学生 checkpoint）'}")
 
     # --- 环境（n_envs=1，关 DR）---
+    # 2026-10-22 实锤：use_residual=True 时基准步态吃 env 内部 state.command，
+    # 与注入 obs[58:61] 的验收指令无关 → 必须 (a) 关内部重采样 (b) 每步强制
+    # state.command=调度指令 (c) 关 max_steps 截断（验收要连续跑 1600 步）
     env_cfg = EnvConfig(
-        dr_enabled=False,          # 标称环境，关 DR
+        dr_enabled=False,                    # 标称环境，关 DR
+        max_steps=10**9,                     # 关 episode 截断
+        cmd_resample_steps=(10**9, 10**9),   # 关内部指令重采样
     )
     env = DogEnvMJX(n_envs=1, config=env_cfg)
     print(f"env: n_envs=1, DR=关, model={env.cfg.action_scale}")
