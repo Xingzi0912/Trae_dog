@@ -106,7 +106,16 @@ class EnvConfig:
     w_jerk: float = 0.01
     w_vz: float = 1.0
     w_rp_rate: float = 0.05
-    track_sigma2: float = 0.25      # 跟踪高斯分母
+    track_sigma2: float = 0.25      # 线速度跟踪高斯分母
+    # yaw 跟踪高斯分母（2026-10-24 从 track_sigma2 拆出，原共用一个 σ=0.5 rad/s）。
+    # 实测航向漂移只有 0.063 rad/s，落在 exp(-0.063²/0.25)=0.984 里只损失 0.008 分，
+    # 策略没有动力修；收紧到 0.10（σ≈0.32）才压得住。
+    yaw_sigma2: float = 0.25
+    # >0 时 yaw 奖励改用**线性**形式 w_yaw*clip(1-|e|/yaw_lin_scale, 0, 1)。
+    # 动机（2026-10-24 实测）：高斯在零点附近是平的，实测航向漂移 0.063 rad/s
+    # 在 σ²=0.25 下只损失 0.008 分、σ²=0.10 也只损失 0.019 分 → 策略没有动力修。
+    # 线性项梯度恒定（-w/scale），1.0 rad/s 量程下每 rad/s 扣 0.5 分，压得住漂移。
+    yaw_lin_scale: float = 0.0
     upright_thresh: float = 0.39    # |g_x|,|g_y| < sin(0.4rad)，与旧阈值等价
     # 域随机化
     dr_enabled: bool = True
@@ -592,7 +601,11 @@ class DogEnvMJX:
         yaw_err = ang_b[2] - cmd[2]
         r_track = cfg.w_track * jnp.exp(-(vx_err ** 2 + vy_err ** 2)
                                         / cfg.track_sigma2)
-        r_yaw = cfg.w_yaw * jnp.exp(-(yaw_err ** 2) / cfg.track_sigma2)
+        if cfg.yaw_lin_scale > 0:      # 静态分支，trace 期求值，不影响 jit
+            r_yaw = cfg.w_yaw * jnp.clip(
+                1.0 - jnp.abs(yaw_err) / cfg.yaw_lin_scale, 0.0, 1.0)
+        else:
+            r_yaw = cfg.w_yaw * jnp.exp(-(yaw_err ** 2) / cfg.yaw_sigma2)
         upright = ((jnp.abs(g_b[0]) < cfg.upright_thresh)
                    & (jnp.abs(g_b[1]) < cfg.upright_thresh))
         r_upright = cfg.w_upright * upright.astype(jnp.float32)

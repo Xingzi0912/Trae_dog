@@ -179,6 +179,17 @@ def main():
                         metavar=("MIN", "MAX"), help="yaw_rate 指令范围（默认 -2.0 2.0）")
     parser.add_argument("--zero_cmd_prob", type=float, default=None,
                         help="零指令概率（默认 0.17）")
+    parser.add_argument("--track_sigma2", type=float, default=None,
+                        help="线速度跟踪高斯分母（默认 0.25 → σ=0.5 m/s）。"
+                             "调小=逼策略精确跟速；注意会拉低 track 均值，"
+                             "相对放大 energy/rp 等惩罚的权重")
+    parser.add_argument("--yaw_sigma2", type=float, default=None,
+                        help="yaw 跟踪高斯分母（默认 0.25 → σ=0.5 rad/s）。"
+                             "注意：高斯在零点附近是平的，靠收紧 σ 压不住小幅持续漂移")
+    parser.add_argument("--yaw_lin_scale", type=float, default=None,
+                        help=">0 时 yaw 奖励改成线性：w_yaw*clip(1-|e|/scale,0,1)。"
+                             "建议 v26 用 1.0（覆盖 ±2 rad/s 指令量程），"
+                             "对 0.06 rad/s 的航向漂移也能给出恒定惩罚")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -234,6 +245,12 @@ def main():
         cmd_kwargs["cmd_yaw"] = tuple(args.cmd_yaw)
     if args.zero_cmd_prob is not None:
         cmd_kwargs["zero_cmd_prob"] = float(args.zero_cmd_prob)
+    if args.track_sigma2 is not None:
+        cmd_kwargs["track_sigma2"] = float(args.track_sigma2)
+    if args.yaw_sigma2 is not None:
+        cmd_kwargs["yaw_sigma2"] = float(args.yaw_sigma2)
+    if args.yaw_lin_scale is not None:
+        cmd_kwargs["yaw_lin_scale"] = float(args.yaw_lin_scale)
 
     env_cfg = EnvConfig(
         dr_enabled=not args.no_dr,
@@ -246,6 +263,8 @@ def main():
         f"dr_pools={env_cfg.dr_pools}, gait_mode={env_cfg.gait_mode}")
     log(f"指令范围: vx={env_cfg.cmd_vx} vy={env_cfg.cmd_vy} "
         f"yaw={env_cfg.cmd_yaw} zero_prob={env_cfg.zero_cmd_prob}")
+    log(f"跟踪 σ²: lin={env_cfg.track_sigma2} (σ={env_cfg.track_sigma2 ** 0.5:.2f} m/s) "
+        f"yaw={env_cfg.yaw_sigma2} (σ={env_cfg.yaw_sigma2 ** 0.5:.2f} rad/s)")
     env = DogEnvMJX(n_envs=n_envs, config=env_cfg)
 
     rng = jax.random.PRNGKey(42)
