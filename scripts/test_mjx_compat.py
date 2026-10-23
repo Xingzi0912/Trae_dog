@@ -54,8 +54,8 @@ def main() -> int:
     mujoco.mj_forward(mj_model, mj_data)
     dx0 = mjx.put_data(mj_model, mj_data)
     base_id = mj_model.body("base_link").id
-    print(f"  base_z(init) = {float(dx0.xpos[base_id, 2]):.4f}（期望 0.27）")
-    print(f"  ctrl[:3] = {dx0.ctrl[:3]}（期望 [0, 0.9, -1.8]）")
+    print(f"  base_z(init) = {float(dx0.xpos[base_id, 2]):.4f}（期望 0.3270，加电姿态）")
+    print(f"  ctrl[:3] = {dx0.ctrl[:3]}（期望 [-0.0134, 0.8611, -1.7340]）")
 
     # ---- 关 3：jit 零策略 1000 物理步（2s）----
     print("\n[3] jit 编译 + 零策略 1000 物理步 ...")

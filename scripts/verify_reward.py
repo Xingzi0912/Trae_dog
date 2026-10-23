@@ -35,7 +35,7 @@ def scenario1_zero_policy():
 
     env = DogEnv()
     _, info = env.reset()
-    print(f"[reset] base_z = {info['base_z']:.4f} m （站立目标 ≈ 0.27m）")
+    print(f"[reset] base_z = {info['base_z']:.4f} m （站立目标 ≈ 0.327m，加电姿态）")
     print()
 
     action = np.zeros(12, dtype=np.float32)

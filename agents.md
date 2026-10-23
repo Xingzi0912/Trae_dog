@@ -181,7 +181,7 @@ BMI088 为 6 轴 IMU，EKF 无磁力计修正，yaw 纯陀螺积分必漂移（�
 | [10:22] | 12 关节角（**sim 系**）                    | qpos[7:]                             | pos16 反馈 → **real→sim 逆映射**         |
 | [22:34] | 12 关节速度（**sim 系**）                  | qvel[6:]                             | vel12 → S×dq_real + 一阶轻低通(~20Hz)    |
 | [34:46] | last_action                                | 缓存上帧输出                         | 同（自身已知量）                         |
-| [46:58] | q_default 常量                             | **固定** [0,0.9,-1.8]×4              | **必须填同一仿真常量**，禁止填实机标定值 |
+| [46:58] | q_default 常量                             | **= `DogEnvMJX.Q_DEFAULT`**（2026-10-23 起为 kp=150 加电实测姿态，不再是 [0,0.9,-1.8]） | **必须填同一仿真常量**，禁止填实机标定值 |
 | [58:61] | **指令 [vx_cmd, vy_cmd, yaw_rate_cmd]**    | 训练随机采样                         | 手柄（单位 m/s, m/s, rad/s）             |
 
 实机关节反馈逆映射（run_policy.py 必须实现，记忆此前只有正向动作映射）：
@@ -518,6 +518,11 @@ python -u train_jax.py --steps 10000 --n_envs 16
 部署换算公式：
 `q_des_real[i] = q_default_real[i] + S[i] × (q_des_sim[i] - q_default_sim[i])`
 （q_default_real 来自 deploy/stance_calibration.json，q_default_sim=[0,0.9,-1.8]×4）
+
+> ⚠️ 2026-10-23 起：**上式的 `q_default_sim` 保持 [0,0.9,-1.8]×4 不变**，它只是映射的
+> 参照点；而仿真侧 `Q_DEFAULT`（动作基准 + obs[46:58] 常量）已换成加电实测姿态。
+> 两者不再相等是对的：零动作时 `q_des_real = q_real_eff + S·Δsim = 实机加电实测姿态`。
+> 写 `run_policy.py` 时**不要**把映射里的 q_default_sim 也换成新值，否则会错位。
 
 ### 站立位标定结果（2026-09-26 calibrate_stance.py 实测）
 

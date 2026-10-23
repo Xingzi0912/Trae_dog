@@ -37,7 +37,9 @@ def log(msg):
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = ROOT / "envs"
 SCENE = str(ENVS / "scene_mjx.xml")
-Q_DEFAULT = np.array([0.0, 0.9, -1.8] * 4)
+# 必须跟仿真单一真源同步：2026-10-23 换成加电实测姿态后，这里写死旧值会让
+# CPU 参考 rollout 的 ctrl 和 obs[46:58] 都跟 MJX 差 0.066 rad，kp=150 下第 1 步就发散。
+Q_DEFAULT = np.asarray(DogEnvMJX.Q_DEFAULT, dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
