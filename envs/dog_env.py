@@ -77,7 +77,7 @@ class RandConfig:
     kp_scale_range: tuple = (0.8, 1.2)
     kv_scale_range: tuple = (0.8, 1.2)
     # ④ 初始状态
-    init_base_z_range: tuple = (0.27, 0.32)   # keyframe 标称 0.27
+    init_base_z_range: tuple = (0.30, 0.34)   # keyframe 标称 0.327（加电姿态）
     init_rpy_noise: float = 0.1               # rad，三轴同幅
     init_joint_noise: float = 0.05            # rad
     init_base_vel_noise: float = 0.1          # m/s（线速度）/ rad/s（角速度）
@@ -107,10 +107,11 @@ class DogEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
 
-    # 默认站立关节角，顺序 [FL, FR, RL, RR] × [hip, thigh, calf]
+    # 加电站立关节角（2026-10-23 kp=150 实测标定），顺序 [FL, FR, RL, RR] × [hip, thigh, calf]
     # 与 dog_positional.xml 的 keyframe home 的 ctrl 一致
     Q_DEFAULT = np.array(
-        [0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8, 0, 0.9, -1.8],
+        [-0.0134, 0.8611, -1.7340, 0.0160, 0.8531, -1.7100,
+         0.0088, 0.8801, -1.7210, -0.0133, 0.9111, -1.6946],
         dtype=np.float64,
     )
     ACTION_SCALE = 0.25  # q_des = q_default + action × 0.25

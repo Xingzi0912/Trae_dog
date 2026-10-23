@@ -168,6 +168,17 @@ def main():
                         help="per-mb 累积 KL 冻结阈值（默认 PPOConfig 的 0.1；"
                              "v12 判决：actor 每 update 烧满 0.1 预算即被冻结"
                              "（16/16 update 触发、11/16 在 epoch 0），放宽至 0.2）")
+    # --- 指令课程（2026-10-23 新增）：缺省 = EnvConfig 的全程范围 ---
+    parser.add_argument("--cmd_vx", type=float, nargs=2, default=None,
+                        metavar=("MIN", "MAX"),
+                        help="vx 指令范围（默认 -0.5 1.5）。kp=150 下 sine 基准在 "
+                             "fwd>=1.0 会摔，建议第一轮用 0 0.5")
+    parser.add_argument("--cmd_vy", type=float, nargs=2, default=None,
+                        metavar=("MIN", "MAX"), help="vy 指令范围（默认 -0.5 0.5）")
+    parser.add_argument("--cmd_yaw", type=float, nargs=2, default=None,
+                        metavar=("MIN", "MAX"), help="yaw_rate 指令范围（默认 -2.0 2.0）")
+    parser.add_argument("--zero_cmd_prob", type=float, default=None,
+                        help="零指令概率（默认 0.17）")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -213,14 +224,28 @@ def main():
     if dr_pools > 1 and n_envs % dr_pools != 0:
         log(f"⚠️ dr_pools={dr_pools} 不整除 n_envs={n_envs}，回退 dr_pools=1")
         dr_pools = 1
+    # 指令范围（课程）：不传则用 EnvConfig 默认（全程）
+    cmd_kwargs = {}
+    if args.cmd_vx is not None:
+        cmd_kwargs["cmd_vx"] = tuple(args.cmd_vx)
+    if args.cmd_vy is not None:
+        cmd_kwargs["cmd_vy"] = tuple(args.cmd_vy)
+    if args.cmd_yaw is not None:
+        cmd_kwargs["cmd_yaw"] = tuple(args.cmd_yaw)
+    if args.zero_cmd_prob is not None:
+        cmd_kwargs["zero_cmd_prob"] = float(args.zero_cmd_prob)
+
     env_cfg = EnvConfig(
         dr_enabled=not args.no_dr,
         use_residual=not args.no_residual,
         dr_pools=dr_pools,
         gait_mode=("ik" if args.gait_mode == "ik" else "sine"),
+        **cmd_kwargs,
     )
     log(f"env: residual={env_cfg.use_residual}, dr={env_cfg.dr_enabled}, "
         f"dr_pools={env_cfg.dr_pools}, gait_mode={env_cfg.gait_mode}")
+    log(f"指令范围: vx={env_cfg.cmd_vx} vy={env_cfg.cmd_vy} "
+        f"yaw={env_cfg.cmd_yaw} zero_prob={env_cfg.zero_cmd_prob}")
     env = DogEnvMJX(n_envs=n_envs, config=env_cfg)
 
     rng = jax.random.PRNGKey(42)

@@ -36,6 +36,7 @@ MEM=${MEM:-0.9}
 # 留空 = 不传该 flag，由 train_jax.py 的 PPOConfig 默认值（0.1）决定
 TARGET_KL_MB=${TARGET_KL_MB:-}
 RESUME=${RESUME:-0}
+EXTRA=()          # 未识别参数原样透传给 train_jax.py
 
 # 解析命令行参数（覆盖默认）
 while [[ $# -gt 0 ]]; do
@@ -45,7 +46,8 @@ while [[ $# -gt 0 ]]; do
         --mem) MEM="$2"; shift 2 ;;
         --target_kl_mb) TARGET_KL_MB="$2"; shift 2 ;;
         --resume) RESUME=1; shift ;;
-        *) echo "未知参数: $1"; exit 1 ;;
+        # 其余参数原样透传（如 --cmd_vx/--cmd_vy/--cmd_yaw/--zero_cmd_prob/--gait_mode）
+        *) EXTRA+=("$1"); shift ;;
     esac
 done
 
@@ -63,6 +65,10 @@ fi
 # 组装训练命令（数组形式：set -u 下旧 bash 展开空 ${arr[@]} 会报错，
 # 而 CMD 永远非空，用 "${CMD[@]}" 安全）
 CMD=(python -u train_jax.py --steps "$STEPS" --n_envs "$N_ENVS")
+# 透传参数（bash 4.4+ 的 set -u 对空数组友好；旧 bash 用下面这个写法保平安）
+if [[ ${#EXTRA[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA[@]}")
+fi
 if [[ -n "$TARGET_KL_MB" ]]; then
     CMD+=(--target_kl_mb "$TARGET_KL_MB")
 fi

@@ -220,11 +220,11 @@
     <magnetometer  name='magnetometer'        site='imu'/>
   </sensor>
 
-  <!-- 改动3：启用 keyframe home（站立姿态） -->
-  <!-- qpos 前 7 维 = freejoint [xyz=0 0 0.27, quat=1 0 0 0]，后 12 维 = [0,0.9,-1.8]×4 -->
-  <!-- ctrl 与 actuator 顺序一致：[FL, FR, RL, RR] × [hip=0, thigh=0.9, calf=-1.8] -->
+  <!-- 改动3：启用 keyframe home（加电站立姿态，2026-10-23 kp=150 实测标定） -->
+  <!-- qpos 前 7 维 = freejoint [xyz=0 0 0.3270, quat=1 0 0 0]（四脚球刚好贴地） -->
+  <!-- 后 12 维与 ctrl 同序：[FL, FR, RL, RR] × [hip, thigh, calf] -->
   <keyframe>
-    <key name="home" qpos="0 0 0.27 1 0 0 0 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8"
-      ctrl="0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8 0 0.9 -1.8" />
+    <key name="home" qpos="0 0 0.3270 1 0 0 0 -0.0134 0.8611 -1.7340 0.0160 0.8531 -1.7100 0.0088 0.8801 -1.7210 -0.0133 0.9111 -1.6946"
+      ctrl="-0.0134 0.8611 -1.7340 0.0160 0.8531 -1.7100 0.0088 0.8801 -1.7210 -0.0133 0.9111 -1.6946" />
   </keyframe>
 </mujoco>

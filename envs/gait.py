@@ -34,7 +34,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-Q_DEFAULT = np.array([0.0, 0.9, -1.8] * 4)
+# 加电站立位（2026-10-23 kp=150 实测标定；替换原 [0,0.9,-1.8]×4）
+Q_DEFAULT = np.array([-0.0134, 0.8611, -1.7340, 0.0160, 0.8531, -1.7100,
+                      0.0088, 0.8801, -1.7210, -0.0133, 0.9111, -1.6946])
 DT = 0.02  # 策略步长
 
 # 步态幅值（rad）
@@ -74,8 +76,11 @@ GAIT_DELTA_BWD = float(np.pi)
 #    → 在 probe_gait.py 判决（全指令存活 + 跟踪≥60%）之前，禁止用于训练。
 L1 = 0.22               # 髋→膝连杆长（m）
 L2 = 0.24               # 膝→脚连杆长（m）
-FOOT_X_NOM = 0.0156665    # q_default 下脚相对 thigh 关节的 x（FK 精确值）
-FOOT_Z_NOM = -0.2859406   # 同上 z
+# 2026-10-23：随加电姿态标定更新（旧值 0.0156665 / -0.2859406 对应手扶标定的
+# 旧 q_default）。新值 = 新站立位下四足端在 hip 系的均值（MuJoCo 实测），使
+# gait_ik(零指令) ≈ 0。
+FOOT_X_NOM = 0.008037     # 脚端相对 hip 关节的 x（新站立位，FK 实测均值）
+FOOT_Z_NOM = -0.302601    # 同上 z
 THIGH_Y_OFF = 0.1039    # thigh 关节相对 hip 关节的横向偏移
 LEG_X = np.array([0.22337, 0.22337, -0.22337, -0.22337])   # 脚在 body 系 x
 LEG_Y = np.array([0.1639, -0.1639, 0.1639, -0.1639])       # 脚在 body 系 y

@@ -40,7 +40,7 @@
     [10:22] 12 关节角  = qpos[7:]
     [22:34] 12 关节速度 = qvel[6:]
     [34:46] last_action（产生当前状态的动作）
-    [46:58] q_default 常量 [0, 0.9, -1.8]×4（实机也必须填此仿真常量）
+    [46:58] q_default 常量（2026-10-23 起为加电站立位，见 Q_DEFAULT；实机必须填同一常量）
     [58:61] 指令 [vx, vy, yaw_rate]（m/s, m/s, rad/s）
 
 用法（训练循环骨架）：
@@ -121,7 +121,7 @@ class EnvConfig:
     base_mass_range: tuple = (0.8, 1.2)    # base_link 质量乘性
     kp_scale_range: tuple = (0.8, 1.2)
     kv_scale_range: tuple = (0.8, 1.2)
-    init_base_z: tuple = (0.27, 0.32)
+    init_base_z: tuple = (0.30, 0.34)
     init_rpy_noise: float = 0.1            # rad
     init_joint_noise: float = 0.05         # rad
     init_vel_noise: float = 0.1            # m/s 与 rad/s
@@ -192,7 +192,9 @@ def tree_where_done(done: jax.Array, fresh, current):
 class DogEnvMJX:
     """MJX 向量化机器狗环境：reset/step 均为 jit+vmap 纯函数"""
 
-    Q_DEFAULT = np.array([0.0, 0.9, -1.8] * 4)   # 站立位（与 keyframe home 一致）
+    # 加电站立位（2026-10-23 kp=150 实测标定；替换原 [0,0.9,-1.8]×4，与 keyframe home 一致）
+    Q_DEFAULT = np.array([-0.0134, 0.8611, -1.7340, 0.0160, 0.8531, -1.7100,
+                          0.0088, 0.8801, -1.7210, -0.0133, 0.9111, -1.6946])
     OBS_DIM = 61
     ACT_DIM = 12
 
