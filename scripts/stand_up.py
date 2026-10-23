@@ -14,7 +14,7 @@
 
 用法（NUC）：
   sudo python3 scripts/stand_up.py [kp] [kd] [rise_sec]
-    kp       默认 100（实机实测站立所需，仿真对齐值 60 偏软）
+    kp       默认 150（实机实测站立所需；仿真已于 2026-10-23 对齐到 150）
     kd       默认 2
     rise_sec 默认 10（起立/趴下各 10 秒）
 
