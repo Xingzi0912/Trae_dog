@@ -48,7 +48,7 @@ S = [+1, +1, +1, +1, -1, -1, -1, +1, +1, -1, -1, -1]
 REAR_CALF = (8, 11)
 FRONT_CALF = (2, 5)
 
-KP_FINAL = float(sys.argv[1]) if len(sys.argv) > 1 else 100.0
+KP_FINAL = float(sys.argv[1]) if len(sys.argv) > 1 else 150.0
 KD_FINAL = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
 RISE_SEC = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
 LOWER_KP_SEC = 2.0       # 趴下后 kp 缓降到 0 的时长
@@ -80,6 +80,11 @@ def drain_lines() -> list:
 
 def load_pose(name: str) -> list:
     p = REPO_ROOT / "deploy" / f"{name}_calibration.json"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"{p} 不存在。请先运行 `python3 scripts/calibrate_stance.py {name}` "
+            f"生成该标定文件（站姿用 stance，趴姿用 lie），"
+            f"或从已标定的机器上拷贝 deploy/ 目录")
     data = json.loads(p.read_text(encoding="utf-8"))
     q = data.get("q_default_real", [])
     if len(q) != 12:

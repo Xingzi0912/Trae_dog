@@ -1,4 +1,4 @@
-"""scripts/verify_reward.py — Step 2 reward 函数手动验证
+r"""scripts/verify_reward.py — Step 2 reward 函数手动验证
 
 三个场景对应 agents.md Step 2 待办的三条：
   1. 零策略：验证 reward ≈ +0.5/step（只有 upright），forward/energy/jerk 都 = 0

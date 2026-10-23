@@ -74,7 +74,7 @@
           <geom size="0.011 0.025" pos="0.0172383 0 -0.184129" quat="0.99935 0 -0.0360572 0" type="cylinder" class="collision"/>
           <geom size="0.0155 0.016" pos="0.00980871 0 -0.219354" quat="0.979277 0 0.202524 0" type="cylinder" class="collision"/>
           <geom pos="0 0 -0.24" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="foot"/>
-          <geom size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
+          <geom name="FL_foot" size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
         </body>
       </body>
     </body>
@@ -96,7 +96,7 @@
           <geom size="0.011 0.025" pos="0.0172383 0 -0.184129" quat="0.99935 0 -0.0360572 0" type="cylinder" class="collision"/>
           <geom size="0.0155 0.016" pos="0.00980871 0 -0.219354" quat="0.979277 0 0.202524 0" type="cylinder" class="collision"/>
           <geom pos="0 0 -0.24" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="foot"/>
-          <geom size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
+          <geom name="FR_foot" size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
         </body>
       </body>
     </body>
@@ -118,7 +118,7 @@
           <geom size="0.011 0.025" pos="0.0172383 0 -0.184129" quat="0.99935 0 -0.0360572 0" type="cylinder" class="collision"/>
           <geom size="0.0155 0.016" pos="0.00980871 0 -0.219354" quat="0.979277 0 0.202524 0" type="cylinder" class="collision"/>
           <geom pos="0 0 -0.24" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="foot"/>
-          <geom size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
+          <geom name="RL_foot" size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
         </body>
       </body>
     </body>
@@ -140,7 +140,7 @@
           <geom size="0.011 0.025" pos="0.0174683 0 -0.184509" quat="0.99935 0 -0.0360572 0" type="cylinder" class="collision"/>
           <geom size="0.0155 0.016" pos="0.0100387 0 -0.219734" quat="0.979277 0 0.202524 0" type="cylinder" class="collision"/>
           <geom pos="0 0 -0.24" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 1 1 1" mesh="foot"/>
-          <geom size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
+          <geom name="RR_foot" size="0.022" pos="-0.002 0 -0.24" rgba="1 1 1 1" class="foot"/>
         </body>
       </body>
       </body>
@@ -149,25 +149,26 @@
   </worldbody>
 
   <!-- 改动2：actuator 从 <motor> 力矩控制改为 <position> 位置控制 -->
-  <!-- kp=60, kv=2（agents.md 决策1，对齐实机 MIT 模式默认） -->
+  <!-- kp=150, kv=2（2026-10-23 对齐实机 MIT：实机 kp=150/kd=2，见 posture_trim.json；
+       旧值 60 是仿真偏软，PD 静差 ~3.5cm） -->
   <!-- ctrlrange 取关节角限位（autolimits=true 也已继承，显式写出更清晰） -->
   <!-- 顺序：[FL, FR, RL, RR] × [hip, thigh, calf]，与 q_default 一致 -->
   <actuator>
-    <position name="FL_hip"    joint="FL_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="FL_thigh"  joint="FL_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="FL_calf"   joint="FL_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="FL_hip"    joint="FL_hip_joint"    kp="150" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
+    <position name="FL_thigh"  joint="FL_thigh_joint"  kp="150" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
+    <position name="FL_calf"   joint="FL_calf_joint"   kp="150" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
 
-    <position name="FR_hip"    joint="FR_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="FR_thigh"  joint="FR_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="FR_calf"   joint="FR_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="FR_hip"    joint="FR_hip_joint"    kp="150" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
+    <position name="FR_thigh"  joint="FR_thigh_joint"  kp="150" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
+    <position name="FR_calf"   joint="FR_calf_joint"   kp="150" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
 
-    <position name="RL_hip"    joint="RL_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="RL_thigh"  joint="RL_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="RL_calf"   joint="RL_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="RL_hip"    joint="RL_hip_joint"    kp="150" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
+    <position name="RL_thigh"  joint="RL_thigh_joint"  kp="150" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
+    <position name="RL_calf"   joint="RL_calf_joint"   kp="150" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
 
-    <position name="RR_hip"    joint="RR_hip_joint"    kp="60" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
-    <position name="RR_thigh"  joint="RR_thigh_joint"  kp="60" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
-    <position name="RR_calf"   joint="RR_calf_joint"   kp="60" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
+    <position name="RR_hip"    joint="RR_hip_joint"    kp="150" kv="2" ctrllimited="true" ctrlrange="-1 1"/>
+    <position name="RR_thigh"  joint="RR_thigh_joint"  kp="150" kv="2" ctrllimited="true" ctrlrange="-1.5 3"/>
+    <position name="RR_calf"   joint="RR_calf_joint"   kp="150" kv="2" ctrllimited="true" ctrlrange="-2.5 -0.85"/>
   </actuator>
 
   <sensor>

@@ -3,7 +3,7 @@
 
 用法（NUC）：
   1. 先用手把狗摆成标准站立姿势（和 calibrate_stance 时一样）
-  2. sudo python3 scripts/stand_hold.py [kp] [kd]     # 默认 kp=60 kd=2
+  2. sudo python3 scripts/stand_hold.py [kp] [kd]     # 默认 kp=150 kd=2
   3. 按 Enter 开始 10 秒 kp 缓升（0→目标值），此过程手继续轻扶
   4. 缓升结束后松手，观察狗能否自主站稳
   5. 按 Ctrl+C 退出，电机失能
@@ -28,7 +28,7 @@ JOINTS = [(ch, mid) for ch in (0, 1, 2, 3) for mid in (0x01, 0x02, 0x03)]
 CH_NAMES = {0: "FL", 1: "FR", 2: "RL", 3: "RR"}
 MID_NAMES = {0x01: "hip", 0x02: "thigh", 0x03: "calf"}
 
-KP_FINAL = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
+KP_FINAL = float(sys.argv[1]) if len(sys.argv) > 1 else 150.0
 KD_FINAL = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
 RAMP_SEC = 10.0          # 缓升时长
 LOOP_HZ = 20.0           # 控制循环 20Hz（50ms）

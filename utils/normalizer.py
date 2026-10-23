@@ -50,7 +50,13 @@ class RunningMeanStd:
         self.count = total
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        """用当前统计量归一化，±10 裁剪防离群点（不更新统计量）"""
+        """用当前统计量归一化，±10 裁剪防离群点（不更新统计量）
+
+        注意：本函数属于旧 PyTorch/CPU 路径，带 ±10 裁剪。JAX 训练链路
+        （ppo_jax / distill_jax）与部署 npz 推理**不做裁剪**，统一为
+        (x - mean) / sqrt(var + 1e-8)。部署端请按后者复现，不要照抄本函数，
+        否则与训练分布不一致（见 agents.md 归一化一致性记录）。
+        """
         x = np.asarray(x, dtype=np.float64)
         out = (x - self.mean) / np.sqrt(self.var + 1e-8)
         return np.clip(out, -10.0, 10.0).astype(np.float32)

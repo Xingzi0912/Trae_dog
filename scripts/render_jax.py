@@ -393,9 +393,12 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         obs_mean = jnp.asarray(obs_rms_dict.mean)
         obs_var = jnp.asarray(obs_rms_dict.var)
     else:
-        obs_mean = jnp.zeros_like(obs[0])
-        obs_var = jnp.ones_like(obs[0])
-        print("  ⚠️ obs_rms 缺失，未做观测归一化（学生 checkpoint 正常）")
+        # 教师输入是 99 维（61 标准 + 38 特权），不能用 obs(61) 的 shape
+        # 兜底，否则下面的归一化会 broadcast 失败。
+        n_teacher = env.OBS_DIM + env.PRIV_DIM
+        obs_mean = jnp.zeros(n_teacher)
+        obs_var = jnp.ones(n_teacher)
+        print("  ⚠️ checkpoint 缺 obs_rms，未做观测归一化（教师策略输出不可信）")
 
     # --- 渲染循环 ---
     frames = []
@@ -502,6 +505,9 @@ def main():
                          '例：--cmds "0:0,0,0; 200:1.0,0,0; 500:0,0.4,0"')
     ap.add_argument("--stochastic", action="store_true",
                     help="用 μ+σ·ε 采样动作（训练 rollout 同款），对照确定性 μ")
+    ap.add_argument("--gait_mode", type=str, default="sine",
+                    choices=["sine", "ik"],
+                    help="基准步态实现，必须与训练该 checkpoint 时一致")
     args = ap.parse_args()
 
     if not args.interactive and not args.video:
@@ -529,9 +535,10 @@ def main():
         dr_enabled=False,                    # 标称环境，关 DR
         max_steps=10**9,                     # 关 episode 截断
         cmd_resample_steps=(10**9, 10**9),   # 关内部指令重采样
+        gait_mode=args.gait_mode,             # 必须与训练时一致
     )
     env = DogEnvMJX(n_envs=1, config=env_cfg)
-    print(f"env: n_envs=1, DR=关, model={env.cfg.action_scale}")
+    print(f"env: n_envs=1, DR=关, gait={env.cfg.gait_mode}")
 
     # --- Actor ---
     actor = make_teacher_actor(action_dim=12)

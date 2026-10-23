@@ -98,6 +98,13 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
     priv = env.get_privileged_obs(state)
     teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
+    # fresh 模板只 reset 一次，循环内按 done 替换（与 PPO rollout 同款）。
+    # 旧版每步全量 env.reset(2048)，是纯浪费——PPO 侧专门重构过这一点。
+    rng, fresh_rng = jax.random.split(rng)
+    fresh_state, fresh_obs = env.reset(fresh_rng, dr_model)
+    fresh_teacher_obs = jnp.concatenate(
+        [fresh_obs, env.get_privileged_obs(fresh_state)], axis=-1)
+
     for _ in range(n_steps):
         # 教师侧用完整 99 维统计量归一化（与 PPO rollout 内的输入一致）
         mu, std, value = teacher_forward(
@@ -113,13 +120,10 @@ def collect_distill_data(rng, teacher_ts, env, n_steps,
         priv = info["privileged_obs"]
         teacher_obs = jnp.concatenate([obs, priv], axis=-1)
 
-        # auto-reset
-        rng, reset_rng = jax.random.split(rng)
-        fresh_state, fresh_obs = env.reset(reset_rng, dr_model)
+        # auto-reset（用预生成的 fresh 模板，不再每步全量 reset）
         state = tree_where_done(done, fresh_state, state)
         obs = tree_where_done(done, fresh_obs, obs)
-        priv = env.get_privileged_obs(state)
-        teacher_obs = jnp.concatenate([obs, priv], axis=-1)
+        teacher_obs = tree_where_done(done, fresh_teacher_obs, teacher_obs)
 
     d = env.OBS_DIM
     return {

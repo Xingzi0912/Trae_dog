@@ -67,7 +67,8 @@ def run_segment(env, estimator, n_steps, actions, label):
         q = data.qpos[7:]
         qd = data.qvel[6:]
         R = data.xmat[model.body("base_link").id].reshape(3, 3)
-        gyro_b = R.T @ data.qvel[3:6]                  # 机身系角速度真值
+        gyro_b = data.qvel[3:6]                        # 机身系角速度真值
+        # （freejoint qvel[3:6] 本就是机身系；旧实现多乘一次 R.T）
         contact = get_contact_mask(model, data)
 
         # 1) 逐脚 FK 位置误差（所有脚都对照，不仅是支撑脚）

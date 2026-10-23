@@ -69,7 +69,7 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from envs.gait import gait as gait_fn
+from envs.gait import gait as gait_fn, gait_ik as gait_ik_fn
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +89,9 @@ class EnvConfig:
     action_scale: float = 0.25    # 旧：q_des = q_default + action×0.25
     residual_scale: float = 0.2   # 残差 RL：q_des = q_default + gait + action×0.2
     use_residual: bool = True     # True=残差模式（基准步态+残差），False=旧模式
+    # 基准步态实现："sine"=v24 正弦相位（仅前进构型稳定）；"ik"=v25 IK 全向
+    # 步进（支撑相匀速后移 + 摆动相抬脚回位，覆盖后退/横移/转向）
+    gait_mode: str = "sine"
     # 指令分布（默认末期全范围）
     cmd_vx: tuple = (-0.5, 1.5)
     cmd_vy: tuple = (-0.5, 0.5)
@@ -112,7 +115,9 @@ class EnvConfig:
     # K∈{128,256,512} 仍走快路径（~1.2x 开销），K∈{8,32,64,2048} 掉慢路径（见
     # scripts/bench_mjx_throughput.py --modes kpool）
     dr_pools: int = 1
-    friction_range: tuple = (0.5, 1.8)     # floor geom friction[0] 绝对值
+    # 足底 geom friction[0] 绝对值（4 只脚同一采样值）。足底 priority=1：
+    # 接触参数完全取 priority 高的一方，地板摩擦不参与——DR 必须打在足底上
+    friction_range: tuple = (0.5, 1.8)
     base_mass_range: tuple = (0.8, 1.2)    # base_link 质量乘性
     kp_scale_range: tuple = (0.8, 1.2)
     kv_scale_range: tuple = (0.8, 1.2)
@@ -128,7 +133,7 @@ class EnvConfig:
 
 class DRParams(NamedTuple):
     """模型级 DR 的 per-env 参数（episode 内恒定，reset 时重采样）"""
-    fric: jax.Array        # floor geom friction[0]
+    fric: jax.Array        # 足底 geom friction[0]（4 只脚同一值）
     mass_scale: jax.Array  # base_link 质量乘子
     kp_scale: jax.Array
     kv_scale: jax.Array
@@ -207,8 +212,15 @@ class DogEnvMJX:
         home_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "home")
         assert home_id >= 0, "keyframe 'home' 缺失"
         self._base_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")
-        self._floor_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "floor")
-        assert self._base_id >= 0 and self._floor_id >= 0
+        assert self._base_id >= 0
+        # 4 只足底 geom id（摩擦 DR 目标；足底 priority=1，地板摩擦不参与接触对，
+        # 改 floor.geom_friction 无效——2026-10-23 代码审查实锤后修复）
+        foot_ids = [
+            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n)
+            for n in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+        ]
+        assert all(i >= 0 for i in foot_ids), "foot geoms (FL/FR/RL/RR_foot) 缺失"
+        self._foot_ids = jnp.asarray(foot_ids)
 
         # 4 条腿 calf body id（用于几何法 contact 检测）
         # foot geom 在 calf body 下，偏移 [0, 0, -0.24]
@@ -218,12 +230,12 @@ class DogEnvMJX:
             mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "RL_calf"),
             mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "RR_calf"),
         ])
-        self._foot_offset = jnp.array([0.0, 0.0, -0.24])  # foot 相对 calf body
+        self._foot_offset = jnp.array([-0.002, 0.0, -0.24])  # 与 XML foot pos 一致
         self._contact_thresh = jnp.float32(0.05)  # 脚 z < 此值判接触
 
         # 模型级 DR 的标称值（_apply_dr 以此恢复再乘/设）
         self._nom_base_mass = jnp.float32(m.body_mass[self._base_id])
-        self._nom_floor_fric = jnp.float32(m.geom_friction[self._floor_id, 0])
+        self._nom_foot_fric = jnp.float32(m.geom_friction[foot_ids[0], 0])
         self._nom_gain0 = jnp.asarray(m.actuator_gainprm[:, 0].copy())   # kp
         self._nom_bias1 = jnp.asarray(m.actuator_biasprm[:, 1].copy())   # -kp
         self._nom_bias2 = jnp.asarray(m.actuator_biasprm[:, 2].copy())   # -kv
@@ -267,7 +279,7 @@ class DogEnvMJX:
         """采样**一份标量**模型级 DR（池内共享，整 rollout 恒定）"""
         cfg = self.cfg
         if not cfg.dr_enabled:
-            return DRParams(fric=self._nom_floor_fric, mass_scale=jnp.float32(1.0),
+            return DRParams(fric=self._nom_foot_fric, mass_scale=jnp.float32(1.0),
                             kp_scale=jnp.float32(1.0), kv_scale=jnp.float32(1.0))
         k1, k2, k3, k4 = jax.random.split(key, 4)
         return DRParams(
@@ -368,6 +380,26 @@ class DogEnvMJX:
         """批量获取特权信息 (n_envs, 38)，供教师网络使用"""
         return jax.vmap(self._get_privileged_obs)(state.dx, state.dr)
 
+    def dr_per_env(self, dr_model: DRParams) -> DRParams:
+        """把模型级 DR（标量 / (K,) 池）展开成 per-env (n_envs,) 叶子
+
+        只用于特权观测与日志；真正进物理的是 build_model 的批化模型。
+        """
+        if self.n_pools == 1:
+            return jax.tree_util.tree_map(
+                lambda x: jnp.broadcast_to(x, (self.n_envs,)), dr_model)
+        rep = self.n_envs // self.n_pools
+        return jax.tree_util.tree_map(
+            lambda x: jnp.repeat(x, rep, axis=0), dr_model)
+
+    def sync_state_dr(self, state: EnvState, dr_model: DRParams) -> EnvState:
+        """把 state.dr 同步为当前模型级 DR（每 update 调用一次）
+
+        物理模型每个 update 都会重建，而 state 里的 dr 只在 reset 时写入。
+        特权观测从 state.dr 读取 DR 真值，不同步就会长期使用过期参数。
+        """
+        return state._replace(dr=self.dr_per_env(dr_model))
+
     # --------------------------------------------------------------
     # per-env 纯函数（vmap 映射目标）
     # --------------------------------------------------------------
@@ -444,7 +476,7 @@ class DogEnvMJX:
         必须在 vmap 外调用：一旦在 vmap 内按 lane 构造模型（旧实现），XLA 会把
         模型当成逐 env 变化的量，mjx.step 快路径失效（实测慢 31 倍，见文件头）。
         """
-        gf = mx.geom_friction.at[self._floor_id, 0].set(dr.fric)
+        gf = mx.geom_friction.at[self._foot_ids, 0].set(dr.fric)
         bm = mx.body_mass.at[self._base_id].set(self._nom_base_mass * dr.mass_scale)
         ag = mx.actuator_gainprm.at[:, 0].set(self._nom_gain0 * dr.kp_scale)
         ab = (mx.actuator_biasprm.at[:, 1].set(self._nom_bias1 * dr.kp_scale)
@@ -486,7 +518,7 @@ class DogEnvMJX:
             [ 6:18] 精确关节位置 = qpos[7:]
             [18:30] 精确关节速度 = qvel[6:]
             [30:34] contact[4]（脚是否着地，几何法：foot_z < 阈值）
-            [34]    地面摩擦系数
+            [34]    足底摩擦系数
             [35]    机身质量乘子
             [36:38] base x/y 世界位置
         """
@@ -520,7 +552,9 @@ class DogEnvMJX:
         action = jnp.clip(action, -1.0, 1.0)
         if cfg.use_residual:
             # 残差模式：q_des = q_default + 基准步态 + action × residual_scale
-            base_gait = gait_fn(state.episode_steps, state.command)
+            base_gait = (gait_ik_fn(state.episode_steps, state.command)
+                         if cfg.gait_mode == "ik"
+                         else gait_fn(state.episode_steps, state.command))
             q_des = self._q_default + base_gait + action * cfg.residual_scale
         else:
             # 旧模式：q_des = q_default + action × action_scale

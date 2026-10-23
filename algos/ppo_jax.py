@@ -327,7 +327,11 @@ def make_update(env, config: PPOConfig, tx):
             # done 提前 reset（st/tobs 由下方 tree_where_done 换 fresh），
             # rew/tobs_new/rterms 屏蔽，避免 1 个 env 的 NaN 污染 2048 路均值。
             finite_env = jnp.isfinite(rew) & jnp.all(jnp.isfinite(obs), axis=-1)
-            done = jnp.logical_or(term, trunc) | (~finite_env)
+            term_only = term & finite_env
+            # 超时截断 ≠ 真终止：s_T 仍是有效状态，GAE 必须用 V(s_T) bootstrap
+            # （rsl_rl/legged_gym 标准做法：rew += γ·V(s_T)，mask 仍切断递推）
+            trunc_only = (trunc & (~term)) & finite_env
+            done = term_only | trunc_only | (~finite_env)
             rew = jnp.where(finite_env, rew, jnp.float32(0.0))
             tobs_new = make_teacher_obs(obs, info["privileged_obs"])
             tobs_new = jnp.where(finite_env[:, None], tobs_new, jnp.float32(0.0))
@@ -345,33 +349,41 @@ def make_update(env, config: PPOConfig, tx):
             # v21b：本策略步内护栏触火的 env 占比（接触爆炸未遂率）
             fire_rate = jnp.mean(
                 (info["qvel_fire_cnt"] > 0).astype(jnp.float32))
-            out = (tobs_n, raw_action, log_prob, value, rew, done, tobs_new,
-                   rterms, fire_rate)
+            out = (tobs_n, raw_action, log_prob, value, rew, done, trunc_only,
+                   tobs_new, rterms, fire_rate)
             return (st, tobs_out, k, act_clip_cnt + n_clipped), out
 
         carry_init = (state, teacher_obs, rng, jnp.float32(0))
         carry_end, ro = jax.lax.scan(scan_step, carry_init, None,
                                      length=rollout_len)
         (state, teacher_obs, rng, act_clip_total) = carry_end
-        (obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
-         rterms_arr, fire_arr) = ro
+        (obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, trunc_arr,
+         raw_arr, rterms_arr, fire_arr) = ro
         n_action_elts = rollout_len * config.n_envs * act_arr.shape[-1]
         action_clip_pct = act_clip_total / jnp.float32(n_action_elts)
         alive_pct = 1.0 - done_arr.mean()
         return state, teacher_obs, rng, (
-            obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr,
-            rterms_arr, action_clip_pct, alive_pct, fire_arr)
+            obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, trunc_arr,
+            raw_arr, rterms_arr, action_clip_pct, alive_pct, fire_arr)
 
     # ------------------------------------------------------------------
     # Part 2: JIT GAE + obs_rms 更新
     # ------------------------------------------------------------------
     @jax.jit
     def jit_gae_rms(mx_model, teacher_obs, raw_arr, obs_arr, act_arr,
-                    lp_arr, val_arr, rew_arr, done_arr,
+                    lp_arr, val_arr, rew_arr, done_arr, trunc_arr,
                     params, obs_mean, obs_var, obs_count):
         tobs_last_n = (teacher_obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
         last_value = critic.apply(params["critic"], tobs_last_n)
-        adv, ret = compute_gae(rew_arr, val_arr, done_arr, last_value,
+        # 超时截断 bootstrap：raw_arr 是**未被 fresh 替换**的真实下一状态，
+        # 用它算 V(s_T) 补进该步回报；done_arr 仍在该步切断 GAE 递推。
+        raw_n = (raw_arr - obs_mean) / jnp.sqrt(obs_var + 1e-8)
+        next_value = critic.apply(
+            params["critic"], raw_n.reshape(-1, raw_n.shape[-1])
+        ).reshape(raw_arr.shape[:2])
+        rew_boot = rew_arr + config.gamma * next_value * trunc_arr.astype(
+            jnp.float32)
+        adv, ret = compute_gae(rew_boot, val_arr, done_arr, last_value,
                                config.gamma, config.gae_lambda)
 
         flat = raw_arr.reshape(-1, raw_arr.shape[-1])
@@ -497,6 +509,9 @@ def train(rng, env, config: PPOConfig,
     """
     # adam 用 lr=1.0，真实 lr 在 jit_update 内由 lr_t 缩放（数学上等价，
     # 同时支持 lr 衰减与 KL epoch mask）
+    assert config.n_envs == env.n_envs, (
+        f"PPOConfig.n_envs={config.n_envs} 与 env.n_envs={env.n_envs} 不一致："
+        f"batch reshape 会崩")
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
         optax.adam(1.0),
@@ -595,6 +610,10 @@ def train(rng, env, config: PPOConfig,
         rng, k_dr = jax.random.split(rng)
         dr_model = env.sample_model_dr(k_dr)
         mx_model = env.build_model(dr_model)
+        # 模型级 DR 每 update 重采样，而 state.dr 只在 reset 写入；一局 1000 步
+        # 远长于 rollout 24 步，若不每 update 同步，教师特权 obs 里的
+        # fric/mass 会长期停留在旧值，与正在跑的物理不一致。
+        state = env.sync_state_dr(state, dr_model)
 
         if config.std_schedule:
             std_t = std_start_eff + (config.std_end - std_start_eff) * min(
@@ -630,15 +649,15 @@ def train(rng, env, config: PPOConfig,
             state, teacher_obs, rng, params,
             obs_rms.mean, obs_rms.var, mx_model,
             fresh_st, fresh_tobs)
-        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, raw_arr, \
-            rterms_arr, action_clip_pct, alive_pct, fire_arr = ro
+        obs_arr, act_arr, lp_arr, val_arr, rew_arr, done_arr, trunc_arr, \
+            raw_arr, rterms_arr, action_clip_pct, alive_pct, fire_arr = ro
 
         # ==============================================================
         # [阶段 2] GAE + RMS
         # ==============================================================
         adv, ret, o_mean, o_var, o_count = jit_gae_rms(
             mx_model, teacher_obs, raw_arr, obs_arr, act_arr,
-            lp_arr, val_arr, rew_arr, done_arr,
+            lp_arr, val_arr, rew_arr, done_arr, trunc_arr,
             params, obs_rms.mean, obs_rms.var, obs_rms.count)
 
         # ==============================================================

@@ -3,7 +3,7 @@
 控制链路：
     PPO 输出 12 维 action ∈ [-1,1]
       → q_des = q_default + action × 0.25
-      → XML <position> actuator（kp=60, kv=2）PD 输出力矩
+      → XML <position> actuator（kp=150, kv=2）PD 输出力矩
     action = 0 时 q_des = q_default = [0, 0.9, -1.8] × 4，维持站立姿态。
 
 时间尺度：
@@ -29,8 +29,10 @@ reward 4 分量（agents.md）：
       + 0.5  × upright_bonus（|roll|,|pitch| < 0.4）
 
 Step 4 域随机化（每次 reset 重新采样，见 RandConfig）：
-    ① 地面摩擦 floor.geom_friction[0] ∈ [0.5, 1.8]
-       （MuJoCo 接触摩擦 = 两 geom 相乘，足底 0.9 → 接触对 0.45~1.62）
+    ① 足底摩擦 4×foot geom friction[0] ∈ [0.5, 1.8]（4 只脚同一采样值）
+       （足底 priority=1：接触参数完全取 priority 高的一方，地板摩擦不参与；
+       等 priority 时的合并规则是逐元素取 max，不是相乘——相乘是 Isaac/PyBullet
+       的规则。此前误改 floor.geom_friction，整维 DR 为死代码，2026-10-23 修复）
     ② 机身质量 ×[0.8, 1.2]
     ③ PD 增益 kp/kv 各 ×[0.8, 1.2]
     ④ 初始状态：base z/姿态、关节角 ±0.05rad、关节速度 ±0.5rad/s 扰动
@@ -67,7 +69,7 @@ class RandConfig:
         - 延迟/噪声：实机 sim2real 的主要 gap 源
     """
     enabled: bool = True
-    # ① 地面摩擦（绝对值，floor geom friction[0]）
+    # ① 足底摩擦（绝对值，4 只脚 foot geom friction[0] 同一采样值）
     friction_range: tuple = (0.5, 1.8)
     # ② 机身质量（乘性）
     base_mass_range: tuple = (0.8, 1.2)
@@ -153,11 +155,14 @@ class DogEnv(gym.Env):
         )
         assert self._base_body_id >= 0, "body 'base_link' not found in XML"
 
-        # floor geom id（摩擦随机化目标，scene_positional.xml 中命名 floor）
-        self._floor_geom_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
-        )
-        assert self._floor_geom_id >= 0, "geom 'floor' not found in scene XML"
+        # 足底 geom id（摩擦随机化目标；足底 priority=1，地板摩擦不参与接触对，
+        # 改 floor 无效——2026-10-23 代码审查实锤后修复）
+        self._foot_geom_ids = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n)
+            for n in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+        ]
+        assert all(i >= 0 for i in self._foot_geom_ids), \
+            "foot geoms (FL/FR/RL/RR_foot) not found in XML"
 
         # 随机化要改的标称模型参数（每次 reset 先恢复再采样，保证各局独立）
         self._nom_body_mass = self.model.body_mass.copy()
@@ -239,9 +244,10 @@ class DogEnv(gym.Env):
         cfg = self.rand_cfg
         rng = self.np_random
 
-        # ① 地面摩擦
+        # ① 足底摩擦（4 只脚同一采样值）
         fric = rng.uniform(*cfg.friction_range)
-        self.model.geom_friction[self._floor_geom_id, 0] = fric
+        for gid in self._foot_geom_ids:
+            self.model.geom_friction[gid, 0] = fric
 
         # ② 机身质量（只改 base_link；腿部质量保持标称）
         m_scale = rng.uniform(*cfg.base_mass_range)
@@ -294,12 +300,12 @@ class DogEnv(gym.Env):
         quat = self.data.qpos[3:7]
         roll, pitch, yaw = self._quat_to_rpy(quat)
 
-        # freejoint qvel: [0:3]=世界系线速度, [3:6]=世界系角速度
-        # xmat = base body 相对世界系的旋转矩阵 R（行主序 9 个数）
-        # 机身系向量 v_b = R^T @ v_w
+        # freejoint qvel：[0:3]=世界系线速度，[3:6]=**机身系**角速度
+        # （mj_objectVelocity 世界系角速度 == R @ qvel[3:6]，2026-10-10 探针
+        # 实证；旧实现多乘了一次 R.T，站立时 R≈I 所以一直没暴露）
         R = self.data.xmat[self._base_body_id].reshape(3, 3)
         lin_vel_base = R.T @ self.data.qvel[0:3]
-        ang_vel_base = R.T @ self.data.qvel[3:6]
+        ang_vel_base = self.data.qvel[3:6]
 
         return {
             "base_z": base_z,

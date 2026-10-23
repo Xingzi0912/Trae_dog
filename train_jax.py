@@ -143,6 +143,10 @@ def main():
                         help="蒸馏总步数（默认=教师 1/4）")
     parser.add_argument("--no_residual", action="store_true",
                         help="禁用残差模式（纯 PPO 从零学走路）")
+    parser.add_argument("--gait_mode", type=str, default=None,
+                        choices=["sine", "ik"],
+                        help="基准步态实现：sine=v24 正弦（仅前进稳定）；"
+                             "ik=v25 IK 全向步进。缺省=EnvConfig 默认 sine")
     parser.add_argument("--no_dr", action="store_true",
                         help="禁用域随机化")
     parser.add_argument("--dr_pools", type=int, default=256,
@@ -213,9 +217,10 @@ def main():
         dr_enabled=not args.no_dr,
         use_residual=not args.no_residual,
         dr_pools=dr_pools,
+        gait_mode=("ik" if args.gait_mode == "ik" else "sine"),
     )
     log(f"env: residual={env_cfg.use_residual}, dr={env_cfg.dr_enabled}, "
-        f"dr_pools={env_cfg.dr_pools}")
+        f"dr_pools={env_cfg.dr_pools}, gait_mode={env_cfg.gait_mode}")
     env = DogEnvMJX(n_envs=n_envs, config=env_cfg)
 
     rng = jax.random.PRNGKey(42)

@@ -22,6 +22,8 @@
 
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <!-- 注意：足底 geom priority=1，脚-地接触参数完全取足底侧，本地板的
+         friction 不参与接触对（摩擦 DR 打在足底 geom 上，见 dog_env.py） -->
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction="1.2 0.1 0.01"/>
   </worldbody>
 </mujoco>

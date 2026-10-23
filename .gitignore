@@ -19,8 +19,10 @@ logs/
 *.onnx
 *.png
 
-# 实机标定产物（FK 高度常数，随实机生成）
+# 实机标定产物（随实机生成，新机器必须先标定）
 deploy/kin_calib.json
+deploy/stance_calibration.json
+deploy/lie_calibration.json
 
 # MuJoCo 可视化缓存
 *.mjb
