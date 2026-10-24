@@ -381,6 +381,20 @@ class Runner:
                          for i in range(12)])
 
     @staticmethod
+    def sim_to_real_cmd(q_sim, q_eff):
+        """指令映射：以 Q_DEFAULT（= 标定站姿 q_eff）为基准
+
+        区别是命门：
+          sim_to_real()      把 Q_DEFAULT 映射到 P_meas（**已经下垂的实测姿态**），
+                             等于命令电机"保持在下垂位置"→ PD 泄力 → 越沉越深；
+          sim_to_real_cmd()  把 Q_DEFAULT 映射到 q_eff（**撑得住的那条指令**），
+                             零残差时下发 q_eff，实机保持标定站姿。
+        2026-10-24 实机实测：前者后腿小腿 29 N·m 顶上限塌掉，后者静止只要 14 N·m。
+        """
+        return np.array([q_eff[i] + S[i] * (q_sim[i] - Q_DEFAULT_NEW[i])
+                         for i in range(12)])
+
+    @staticmethod
     def contact_mask(q_sim):
         zs = [leg_fk(q_sim[3 * i:3 * i + 3], i)[0][2] for i in range(4)]
         thr = min(zs) + 0.03
@@ -677,7 +691,9 @@ class Runner:
                         q_des_sim = np.clip(Q_DEFAULT_NEW + g
                                             + 0.2 * args.action_scale * a,
                                             JNT_LO, JNT_HI)
-                        q_cmd = self.sim_to_real(q_des_sim, self.q_eff)
+                        q_cmd = (self.sim_to_real_cmd(q_des_sim, self.q_eff)
+                                 if args.cmd_base == "stance"
+                                 else self.sim_to_real(q_des_sim, self.q_eff))
                         self.step += 1
                         if self.step % 25 == 0:
                             print(f"    t={self.step * DT:5.1f}s vx={self.vx_eff:+.2f} "
@@ -753,6 +769,9 @@ def main():
     ap.add_argument("--action-scale", type=float, default=1.0,
                     help="残差权限缩放（默认 1.0 = 训练时的 0.2 rad）。"
                          "实机力矩不够时先降到 0.5 试")
+    ap.add_argument("--cmd-base", choices=["stance", "measured"], default="stance",
+                    help="指令基准：stance=以标定站姿 q_eff 为基准（默认，实机验证能撑住）；"
+                         "measured=以实测姿态 P_meas 为基准（旧行为，会让后腿力矩顶上限）")
     ap.add_argument("--imu-port", default=None, help="IMU 串口；不给就自动扫描")
     ap.add_argument("--imu-gyro-deg", action="store_true", help="陀螺输出为 °/s")
     args = ap.parse_args()
