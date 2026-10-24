@@ -21,10 +21,12 @@ vx 从 0 到目标值有 0.3 s 线性斜坡，避免步态幅值突跳。
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -262,6 +264,29 @@ class EnterInput:
 
 
 # ---------------------------------------------------------------- IMU
+# ---------------------------------------------------------------- 设备扫描
+def scan_serial_ports():
+    """列出可能的串口（Linux / Windows 都覆盖）"""
+    pats = ["/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyCH343USB*",
+            "/dev/serial/by-id/*"]
+    ports = []
+    for pat in pats:
+        ports.extend(sorted(glob.glob(pat)))
+    if not ports and os.name == "nt":
+        try:
+            from serial.tools import list_ports
+            ports = [p.device for p in list_ports.comports()]
+        except Exception:
+            pass
+    seen, out = set(), []
+    for p in ports:
+        real = os.path.realpath(p)
+        if real not in seen:
+            seen.add(real)
+            out.append(p)
+    return out
+
+
 class ImuReader:
     def __init__(self, port, baud=115200, gyro_deg=False):
         import serial
@@ -283,6 +308,14 @@ class ImuReader:
         if self.gyro_deg:
             g = np.deg2rad(g)
         return np.asarray(qua, dtype=np.float64), g
+
+    def probe(self, seconds=1.5):
+        """自检：读一小段，返回各类型帧数（判断这条口到底是不是 IMU）"""
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.latest()
+            time.sleep(0.01)
+        return dict(self.parser.counts)
 
     def close(self):
         try:
@@ -349,20 +382,92 @@ class Runner:
         return np.concatenate([[self.base_z], g_b, lin_b, gyro, q_sim, dq_sim,
                                self.last_action, Q_DEFAULT_NEW, cmd])
 
+    # ---- 设备自检 ----
+    def preflight_pad(self):
+        print("[1/3] 手柄")
+        try:
+            import pygame
+        except ImportError:
+            print("      ✗ 未安装 pygame —— 手柄不可用（可改用 --input key）")
+            return None
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+        try:
+            pygame.init()
+            pygame.joystick.init()
+            n = pygame.joystick.get_count()
+            if n == 0:
+                print("      ✗ 未检测到手柄（检查 USB / 权限 / 是否被占用）")
+                return None
+            print(f"      ✓ 找到 {n} 个")
+            for i in range(n):
+                j = pygame.joystick.Joystick(i)
+                j.init()
+                print(f"        #{i} {j.get_name()}  axes={j.get_numaxes()} "
+                      f"buttons={j.get_numbuttons()}")
+            pygame.quit()
+            return n
+        except Exception as e:
+            print(f"      ✗ pygame 初始化失败：{e}")
+            return None
+
+    def preflight_imu(self):
+        print("[2/3] IMU")
+        cands = [self.args.imu_port] if self.args.imu_port else scan_serial_ports()
+        if not cands:
+            print("      ✗ 没找到任何串口（/dev/ttyACM* / /dev/ttyUSB*）")
+            print("        → python3 scripts/test_imu.py --list")
+            return None
+        print(f"      候选串口：{cands}")
+        for port in cands:
+            try:
+                r = ImuReader(port, gyro_deg=self.args.imu_gyro_deg)
+            except Exception as e:
+                print(f"      {port}: 打不开（{type(e).__name__}: {e}）")
+                continue
+            counts = r.probe(1.5)
+            total = sum(counts.values())
+            if total == 0:
+                print(f"      {port}: 无有效帧（不是这个设备，或波特率不对）")
+                r.close()
+                continue
+            qua, gyr = r.latest()
+            msg = f"      ✓ {port} 收到帧 {counts}"
+            if qua is not None:
+                R = quat_to_mat(qua)
+                g_b = -R[2, :]
+                msg += f"\n        静止姿态 g_b=[{g_b[0]:+.2f},{g_b[1]:+.2f},{g_b[2]:+.2f}]" \
+                       f"  陀螺=[{gyr[0]:+.2f},{gyr[1]:+.2f},{gyr[2]:+.2f}]"
+            print(msg)
+            self.imu = r
+            return port
+        print("      ✗ 所有候选口都没收到 IMU 帧")
+        return None
+
+    def preflight_can(self):
+        print("[3/3] 达妙 LinkX-4C (CAN)")
+        try:
+            bus = MotorBus()
+        except Exception as e:
+            print(f"      ✗ 打开失败：{e}")
+            print("        排查：lsusb 是否能看到设备 / 插紧 / 换 USB 口 / sudo")
+            try:
+                out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+                for line in out.stdout.splitlines():
+                    if any(k in line.lower() for k in ("damiao", "dm", "wch", "can", "serial", "future")):
+                        print(f"        lsusb: {line}")
+            except Exception:
+                pass
+            return None
+        print("      ✓ 设备已打开")
+        return bus
+
     # ---- 主循环 ----
     def run(self):
         args = self.args
         dry = args.dry_run
         kp_target = 0.0 if dry else KP_FINAL
 
-        if args.imu_port:
-            self.imu = ImuReader(args.imu_port, gyro_deg=args.imu_gyro_deg)
-            print(f"IMU 已打开 {args.imu_port}")
-
-        inp = {"key": KeyInput, "pad": lambda: PadInput(args.pad_button),
-               "enter": EnterInput}[args.input]()
-
-        bus = MotorBus()
         print("=" * 78)
         print(" 学生策略上实机 —— " + ("【dry-run】kp=0，狗不会动" if dry else "【GO】真实运行"))
         print("=" * 78)
@@ -375,7 +480,40 @@ class Runner:
         else:
             print(" 按键：Enter 推进阶段（RUN 中 Enter 停止）")
         if args.imu_port is None:
-            print(" ⚠ 未接 IMU：g_b 固定 [0,0,-1]、陀螺置零 —— 不要用 --go")
+            print(" IMU 端口未指定 —— 自检会扫描所有候选串口")
+
+        # ---------------- 设备自检（手柄 / IMU / LinkX-4C）----------------
+        print("\n╔════════════════ 设备自检 ════════════════╗")
+        n_pad = self.preflight_pad()
+        imu_ok = self.preflight_imu()
+
+        ok = True
+        if args.input == "pad" and not n_pad:
+            print("  ✗ --input pad 需要手柄（或改用 --input key）")
+            ok = False
+        elif not n_pad:
+            print("  （无手柄，本次用键盘）")
+
+        if not imu_ok:
+            if dry:
+                print("  ⚠ dry-run 无 IMU 可继续（g_b 固定、陀螺为 0）")
+            else:
+                print("  ✗ --go 必须接 IMU：没有姿态/角速度，策略等于闭眼")
+                ok = False
+
+        bus = self.preflight_can()
+        if bus is None:
+            ok = False
+        print("╚══════════════════════════════════════════╝")
+        if not ok:
+            print("\n自检未通过，退出。修好上面带 ✗ 的项再跑。")
+            if bus is not None:
+                bus.close()
+            return
+        print("设备就绪。\n")
+
+        inp = {"key": KeyInput, "pad": lambda: PadInput(args.pad_button),
+               "enter": EnterInput}[args.input]()
 
         phase, t_phase = "WAIT", 0.0
         q_cmd = self.q_lie.copy()
