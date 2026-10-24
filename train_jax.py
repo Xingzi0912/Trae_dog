@@ -190,6 +190,10 @@ def main():
                         help=">0 时 yaw 奖励改成线性：w_yaw*clip(1-|e|/scale,0,1)。"
                              "建议 v26 用 1.0（覆盖 ±2 rad/s 指令量程），"
                              "对 0.06 rad/s 的航向漂移也能给出恒定惩罚")
+    parser.add_argument("--w_yaw", type=float, default=None,
+                        help="yaw 项权重（默认 0.5）。专项练直线时可提到 2.0："
+                             "此时建议配 --cmd_yaw 0 0，让该项退化为纯航向保持，"
+                             "避免被'不会转向'的常数惩罚淹没")
     args = parser.parse_args()
 
     # --mem 覆盖环境变量
@@ -251,6 +255,8 @@ def main():
         cmd_kwargs["yaw_sigma2"] = float(args.yaw_sigma2)
     if args.yaw_lin_scale is not None:
         cmd_kwargs["yaw_lin_scale"] = float(args.yaw_lin_scale)
+    if args.w_yaw is not None:
+        cmd_kwargs["w_yaw"] = float(args.w_yaw)
 
     env_cfg = EnvConfig(
         dr_enabled=not args.no_dr,
