@@ -310,6 +310,7 @@ class Runner:
         self.dist_x = 0.0
         self.dist_y = 0.0
         self.t_move = 0.0
+        self.tau_over = 0.0
 
     # ---- 电机 ----
     def send(self, bus, q_real, kp, kd):
@@ -634,6 +635,17 @@ class Runner:
                         print(f"\n>>> ⚠ base_z={self.base_z:.3f} 过低，中止 <<<")
                         phase, t_phase = "FADE", 0.0
                         continue
+                    # 力矩保护：实机 2026-10-24 两次 CAN 掉线都发生在 |tau|>34 之后
+                    tau_now = float(np.nanmax(np.abs(tau))) if n_fresh else 0.0
+                    if not dry and tau_now > args.tau_abort:
+                        self.tau_over += DT
+                        if self.tau_over >= 0.2:
+                            print(f"\n>>> ⚠ |tau|max={tau_now:.0f} N·m 超过 {args.tau_abort:.0f}"
+                                  f" 已 {self.tau_over:.1f}s，主动停止（防 CAN 掉线）<<<")
+                            phase, t_phase = "FADE", 0.0
+                            continue
+                    else:
+                        self.tau_over = 0.0
                     target = args.vx if walking else 0.0
                     dv = args.vx / max(RAMP_SEC, 1e-3) * dt
                     if self.vx_eff < target:
@@ -805,6 +817,10 @@ def main():
                          "（默认 0.02；速度估计乱跳时可收紧到 0.01）")
     ap.add_argument("--v-clip", type=float, default=1.0,
                     help="喂给策略的机身系线速度限幅（m/s，默认 1.0）")
+    ap.add_argument("--tau-abort", type=float, default=30.0,
+                    help="|tau| 超过此值并持续 0.2s 就主动停止（默认 30 N·m）。"
+                         "实机 2026-10-24 两次 CAN 掉线都紧跟 |tau|>34，"
+                         "此保护用于避免再次打断 USB 链路")
     ap.add_argument("--imu-port", default=None, help="IMU 串口；不给就自动扫描")
     ap.add_argument("--imu-gyro-deg", action="store_true", help="陀螺输出为 °/s")
     args = ap.parse_args()
