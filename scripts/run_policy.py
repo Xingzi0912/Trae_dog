@@ -317,13 +317,57 @@ class Runner:
     def read_q(self, bus):
         q = np.full(12, np.nan)
         dq = np.full(12, np.nan)
+        tau = np.full(12, np.nan)
+        fresh = 0
         for ch, mid in JOINTS:
             fb = bus.get_feedback(ch, mid, max_age=0.3)
             i = ch * 3 + (mid - 1)
             if fb and "pos" in fb:
                 q[i] = fb["pos"]
                 dq[i] = fb.get("vel", 0.0)
-        return q, dq
+                tau[i] = fb.get("tau", 0.0)
+                fresh += 1
+        return q, dq, tau, fresh
+
+    def limp_and_disable(self, bus):
+        """软停：先用 kp=kd=tau=0 连发（DISABLE 丢帧也能让腿松），再失能并验证"""
+        print("\n>>> 软停中：kp=0 连续下发 0.25s，再失能…")
+        for _ in range(12):
+            for ch, mid in JOINTS:
+                i = ch * 3 + (mid - 1)
+                try:
+                    bus.send_mit(ch, mid, float(self.q_lie[i]), 0.0, 0.0, 0.0, 0.0)
+                except Exception:
+                    pass
+            time.sleep(0.02)
+        for _ in range(3):
+            for ch, mid in JOINTS:
+                try:
+                    bus.disable_motor(ch, mid)
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
+        # 验证：反馈是否还在、力矩是否已接近 0
+        n_fresh, taus = 0, []
+        for ch, mid in JOINTS:
+            fb = bus.get_feedback(ch, mid, max_age=0.5)
+            if fb is not None:
+                n_fresh += 1
+                taus.append(abs(fb.get("tau", 0.0)))
+        tmax = max(taus) if taus else float("nan")
+        if n_fresh == 0:
+            print("\n" + "!" * 62)
+            print("!!! CAN 链路已断：失能指令没能送达，电机可能仍在使能 !!")
+            print("!!! 立即断开狗的总电源（不是关脚本）              !!")
+            print("!" * 62)
+            return False
+        if tmax > 1.5:
+            print(f"\n>>> ⚠ 失能后仍有 |tau|max={tmax:.1f} N·m（反馈 {n_fresh}/12）")
+            print(">>> 若狗仍能顶住，请断电确认")
+            return False
+        print(f">>> 已失能确认：反馈 {n_fresh}/12，|tau|max={tmax:.2f} N·m")
+        return True
 
     @staticmethod
     def real_to_sim(q_real, dq_real, q_eff):
@@ -598,7 +642,12 @@ class Runner:
                         break
 
                 # ---------------- 数据链路 ----------------
-                q_real, dq_real = self.read_q(bus)
+                q_real, dq_real, tau, n_fresh = self.read_q(bus)
+                if phase == "RUN" and n_fresh == 0:
+                    print("\n>>> ⚠ 收不到电机反馈（CAN 可能已断），停止策略 <<<")
+                    print(">>> 若狗仍在用力，立即断电！")
+                    phase, t_phase = "FADE", 0.0
+                    continue
                 if not np.any(np.isnan(q_real)) and phase in (
                         "SETTLE", "WAIT_RUN", "RUN", "FADE", "WAIT_SIT"):
                     q_sim, dq_sim = self.real_to_sim(q_real, dq_real, self.q_eff)
@@ -625,7 +674,9 @@ class Runner:
                         a = self.last_action + np.clip(a - self.last_action, -0.15, 0.15)
                         self.last_action = a.copy()
                         g = gait_np(self.step, cmd)
-                        q_des_sim = np.clip(Q_DEFAULT_NEW + g + 0.2 * a, JNT_LO, JNT_HI)
+                        q_des_sim = np.clip(Q_DEFAULT_NEW + g
+                                            + 0.2 * args.action_scale * a,
+                                            JNT_LO, JNT_HI)
                         q_cmd = self.sim_to_real(q_des_sim, self.q_eff)
                         self.step += 1
                         if self.step % 25 == 0:
@@ -633,7 +684,9 @@ class Runner:
                                   f"z={self.base_z:.3f} "
                                   f"g_b=[{g_b[0]:+.2f},{g_b[1]:+.2f}] "
                                   f"v_b=[{lin_b[0]:+.2f},{lin_b[1]:+.2f}] "
-                                  f"|a|={np.abs(a).mean():.2f}")
+                                  f"|a|={np.abs(a).mean():.2f} "
+                                  f"|tau|max={np.nanmax(np.abs(tau)):.1f} "
+                                  f"rear_calf_tau=[{tau[8]:+.1f},{tau[11]:+.1f}]")
                     elif phase in ("SETTLE", "WAIT_RUN") and n_loop % 25 == 0:
                         print(f"    z={self.base_z:.3f} "
                               f"g_b=[{g_b[0]:+.2f},{g_b[1]:+.2f},{g_b[2]:+.2f}] "
@@ -668,15 +721,15 @@ class Runner:
                 self.pad.close()
             if self.imu is not None:
                 self.imu.close()
-            for ch, mid in JOINTS:
-                try:
-                    bus.disable_motor(ch, mid)
-                except Exception:
-                    pass
             if n_loop:
                 print(f"\n循环 {n_loop} 次，{n_slow} 次没跟上 50Hz"
                       f"（{100.0 * n_slow / max(1, n_loop):.1f}%）")
-            print("电机已失能。")
+            # 软停 + 失能 + 验证（不再静默失败）
+            ok = self.limp_and_disable(bus)
+            if ok:
+                print("电机已失能（已通过反馈确认）。")
+            else:
+                print("⚠ 失能未确认！请看上面的红色警告。")
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
@@ -697,6 +750,9 @@ def main():
     ap.add_argument("--z-abort", type=float, default=0.26, help="base_z 低于此值中止")
     ap.add_argument("--q-dev-max", type=float, default=0.35,
                     help="启动策略前允许的 max|q_sim-Q_DEFAULT|（默认 0.35 rad）")
+    ap.add_argument("--action-scale", type=float, default=1.0,
+                    help="残差权限缩放（默认 1.0 = 训练时的 0.2 rad）。"
+                         "实机力矩不够时先降到 0.5 试")
     ap.add_argument("--imu-port", default=None, help="IMU 串口；不给就自动扫描")
     ap.add_argument("--imu-gyro-deg", action="store_true", help="陀螺输出为 °/s")
     args = ap.parse_args()
