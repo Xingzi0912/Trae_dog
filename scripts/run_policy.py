@@ -305,6 +305,8 @@ class Runner:
         self.vx_eff = 0.0
         self.walk_on = False
         self.last_walking = False
+        self.q_sim = np.zeros(12)
+        self.q_dev = float("nan")
 
     # ---- 电机 ----
     def send(self, bus, q_real, kp, kd):
@@ -532,11 +534,18 @@ class Runner:
                 elif phase == "WAIT_RUN":
                     kp_now, q_cmd = kp_target, self.q_eff
                     if advance:
+                        # 安全闸：关节角必须落在站姿附近，否则映射错或狗没站稳
+                        if not dry and not (self.q_dev < args.q_dev_max):
+                            print(f"\n>>> ⚠ 关节角偏离站姿 max|Δq|={self.q_dev:.2f} rad"
+                                  f"（上限 {args.q_dev_max}），拒绝启动策略")
+                            print(">>> 检查：S 矩阵映射 / 狗是否真的站稳 / 标定姿态是否被改动")
+                            continue
                         phase, t_phase = "RUN", 0.0
                         run_t0 = time.time()
                         self.step = 0
                         self.vx_eff = 0.0
                         self.walk_on = False
+                        self.last_walking = False
                         self.last_action[:] = 0.0
                         print("\n>>> 策略已启动：按 w 或按住手柄按钮让它走 <<<")
 
@@ -603,6 +612,8 @@ class Runner:
                     if gyr is None:
                         gyr = np.zeros(3)
                     contact = self.contact_mask(q_sim)
+                    self.q_sim = q_sim
+                    self.q_dev = float(np.abs(q_sim - Q_DEFAULT_NEW).max())
                     z_est, v_est = self.kin.update(q_sim, dq_sim, rpy, gyr, contact)
                     self.base_z = float(z_est)
                     lin_b = np.asarray(v_est, dtype=np.float64)
@@ -629,6 +640,10 @@ class Runner:
                               f"陀螺=[{gyr[0]:+.2f},{gyr[1]:+.2f},{gyr[2]:+.2f}] "
                               f"v_b=[{lin_b[0]:+.2f},{lin_b[1]:+.2f},{lin_b[2]:+.2f}] "
                               f"contact={contact.astype(int)}")
+                        print(f"    q_real=[{', '.join(f'{v:+.2f}' for v in q_real)}]")
+                        print(f"    q_sim =[{', '.join(f'{v:+.2f}' for v in q_sim)}]")
+                        print(f"    max|q_sim-Q_DEFAULT| = {self.q_dev:.3f} rad"
+                              f"   （站立时应 <0.10；>0.35 拒绝启动）")
 
                 self.send(bus, q_cmd, kp_now, KD_FINAL if kp_now > 0 else 0.0)
 
@@ -680,6 +695,8 @@ def main():
     ap.add_argument("--vx", type=float, default=0.3, help="前进速度（默认 0.3）")
     ap.add_argument("--duration", type=float, default=20.0, help="RUN 阶段最长时长")
     ap.add_argument("--z-abort", type=float, default=0.26, help="base_z 低于此值中止")
+    ap.add_argument("--q-dev-max", type=float, default=0.35,
+                    help="启动策略前允许的 max|q_sim-Q_DEFAULT|（默认 0.35 rad）")
     ap.add_argument("--imu-port", default=None, help="IMU 串口；不给就自动扫描")
     ap.add_argument("--imu-gyro-deg", action="store_true", help="陀螺输出为 °/s")
     args = ap.parse_args()
