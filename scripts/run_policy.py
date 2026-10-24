@@ -296,7 +296,7 @@ class Runner:
         self.q_eff = apply_trim(self.q_stand, float(tri.get("front", 0.0)),
                                 float(tri.get("rear", 0.0)))
         self.policy = StudentNpz(args.npz)
-        self.kin = KinEstimator(lpf_alpha=0.5)
+        self.kin = KinEstimator(lpf_alpha=args.lpf_alpha)
         self.imu = None
         self.pad = None
         self.last_action = np.zeros(12)
@@ -398,10 +398,23 @@ class Runner:
                          for i in range(12)])
 
     @staticmethod
-    def contact_mask(q_sim):
-        zs = [leg_fk(q_sim[3 * i:3 * i + 3], i)[0][2] for i in range(4)]
-        thr = min(zs) + 0.03
-        return np.array([z < thr for z in zs])
+    def contact_mask(q_sim, margin=0.02):
+        """支撑脚掩码：最低脚 + margin 以内，且**最多取最低的两只**
+
+        trot 任何时刻只有 2 只脚着地。若按 margin 把摆动腿也算进来（低速时
+        摆动腿只抬起约 1.7cm，很容易落进 3cm 带内），摆动腿的关节速度会被
+        当成机身速度算进 FK 速度估计 → v_b 爆表 → 策略追假速度 → 原地抖。
+        实机 2026-10-24 实测 v_b 在 ±0.3~0.45 之间乱跳，根因即此。
+        """
+        zs = np.array([leg_fk(q_sim[3 * i:3 * i + 3], i)[0][2] for i in range(4)])
+        order = np.argsort(zs)
+        thr = zs[order[0]] + margin
+        mask = np.zeros(4, dtype=bool)
+        for i in order:
+            if zs[i] > thr or mask.sum() >= 2:
+                break
+            mask[i] = True
+        return mask
 
     def build_obs(self, q_sim, dq_sim, gyro, g_b, lin_b, cmd):
         return np.concatenate([[self.base_z], g_b, lin_b, gyro, q_sim, dq_sim,
@@ -680,12 +693,14 @@ class Runner:
                         rpy, R, g_b = np.zeros(3), np.eye(3), np.array([0.0, 0.0, -1.0])
                     if gyr is None:
                         gyr = np.zeros(3)
-                    contact = self.contact_mask(q_sim)
+                    contact = self.contact_mask(q_sim, args.contact_margin)
                     self.q_sim = q_sim
                     self.q_dev = float(np.abs(q_sim - Q_DEFAULT_NEW).max())
                     z_est, v_est = self.kin.update(q_sim, dq_sim, rpy, gyr, contact)
                     self.base_z = float(z_est)
                     lin_b = np.asarray(v_est, dtype=np.float64)
+                    # 打滑时 FK 速度会爆表，限幅防止策略被假信号带跑
+                    lin_b = np.clip(lin_b, -args.v_clip, args.v_clip)
 
                     if phase == "RUN":
                         cmd = np.array([self.vx_eff, 0.0, 0.0])
@@ -782,6 +797,14 @@ def main():
     ap.add_argument("--cmd-base", choices=["stance", "measured"], default="stance",
                     help="指令基准：stance=以标定站姿 q_eff 为基准（默认，实机验证能撑住）；"
                          "measured=以实测姿态 P_meas 为基准（旧行为，会让后腿力矩顶上限）")
+    ap.add_argument("--lpf-alpha", type=float, default=0.5,
+                    help="FK 速度/高度低通系数（50Hz 下 0.5≈11Hz，越小越平滑；"
+                         "实机抖动时用 0.2~0.25）")
+    ap.add_argument("--contact-margin", type=float, default=0.02,
+                    help="支撑脚判定带（脚高 < 最低脚 + margin），且最多取最低的两只"
+                         "（默认 0.02；速度估计乱跳时可收紧到 0.01）")
+    ap.add_argument("--v-clip", type=float, default=1.0,
+                    help="喂给策略的机身系线速度限幅（m/s，默认 1.0）")
     ap.add_argument("--imu-port", default=None, help="IMU 串口；不给就自动扫描")
     ap.add_argument("--imu-gyro-deg", action="store_true", help="陀螺输出为 °/s")
     args = ap.parse_args()
