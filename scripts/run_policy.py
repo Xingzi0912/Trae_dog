@@ -307,6 +307,9 @@ class Runner:
         self.last_walking = False
         self.q_sim = np.zeros(12)
         self.q_dev = float("nan")
+        self.dist_x = 0.0
+        self.dist_y = 0.0
+        self.t_move = 0.0
 
     # ---- 电机 ----
     def send(self, bus, q_real, kp, kd):
@@ -605,6 +608,7 @@ class Runner:
                         self.walk_on = False
                         self.last_walking = False
                         self.last_action[:] = 0.0
+                        self.dist_x = self.dist_y = self.t_move = 0.0
                         print("\n>>> 策略已启动：按 w 或按住手柄按钮让它走 <<<")
 
                 elif phase == "RUN":
@@ -633,7 +637,9 @@ class Runner:
                     self.vx_eff = max(0.0, self.vx_eff - args.vx / RAMP_SEC * dt)
                     if t_phase >= 1.0 and self.vx_eff <= 1e-3:
                         phase, t_phase = "WAIT_SIT", 0.0
-                        print("\n>>> 已回到站姿保持。按 Enter 趴下并失能 <<<")
+                        print(f"\n>>> 本段航位推算：前进 {self.dist_x:+.2f} m / 横移 "
+                              f"{self.dist_y:+.2f} m（累计迈步 {self.t_move:.1f} s）")
+                        print(">>> 已回到站姿保持。按 Enter 趴下并失能 <<<")
 
                 elif phase == "WAIT_SIT":
                     kp_now, q_cmd = kp_target, self.q_eff
@@ -695,6 +701,10 @@ class Runner:
                                  if args.cmd_base == "stance"
                                  else self.sim_to_real(q_des_sim, self.q_eff))
                         self.step += 1
+                        self.dist_x += lin_b[0] * DT
+                        self.dist_y += lin_b[1] * DT
+                        if self.vx_eff > 0.02:
+                            self.t_move += DT
                         if self.step % 25 == 0:
                             print(f"    t={self.step * DT:5.1f}s vx={self.vx_eff:+.2f} "
                                   f"z={self.base_z:.3f} "
