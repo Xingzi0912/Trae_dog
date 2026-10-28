@@ -134,6 +134,70 @@ def gait_np(step: int, cmd) -> np.ndarray:
         -amp_hip * hs + yaw_hip, amp_thigh * math.sin(pa), amp_calf * math.sin(pa + delta)])
 
 
+# ------------------------------------------------------------------ IK 步态（numpy 版）
+# 与 envs/gait.py::gait_ik 逐位对齐。2026-10-28 起训练用 gait_mode="ik"：
+# 正弦步态的推进方向由触地时序涌现（实机上会反向），IK 版由几何显式保证。
+L1, L2 = 0.22, 0.24
+FOOT_X_NOM, FOOT_Z_NOM = 0.008037, -0.302601
+THIGH_Y_OFF = 0.1039
+LEG_X = np.array([0.22337, 0.22337, -0.22337, -0.22337])
+LEG_Y = np.array([0.1639, -0.1639, 0.1639, -0.1639])
+THIGH_Y = np.array([THIGH_Y_OFF, -THIGH_Y_OFF, THIGH_Y_OFF, -THIGH_Y_OFF])
+LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])
+IK_DUTY, IK_LIFT, IK_MAX_STEP, IK_STRIDE_GAIN = 0.55, 0.06, 0.20, 1.0
+
+
+def _ik_planar_np(x, z):
+    r2 = np.maximum(x * x + z * z, 1e-6)
+    c2 = np.clip((r2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2), -1.0, 1.0)
+    q2 = -np.arccos(c2)
+    q1 = np.arctan2(-x, -z) - np.arctan2(L2 * np.sin(q2), L1 + L2 * np.cos(q2))
+    return q1, q2
+
+
+def gait_ik_np(step: int, cmd) -> np.ndarray:
+    """与 envs/gait.py::gait_ik 对齐的 numpy 实现（对拍偏差 <1e-6 rad）"""
+    vx, vy, yaw = float(cmd[0]), float(cmd[1]), float(cmd[2])
+    speed = math.sqrt(vx * vx + vy * vy) + 0.25 * abs(yaw)
+    freq = FREQ_MIN + (FREQ_MAX - FREQ_MIN) * min(max(speed / 1.2, 0.0), 1.0)
+    cyc = 1.0 / freq
+    amp = min(max(speed / 0.3, 0.0), 1.0)
+
+    phase = (step * DT / cyc) % 1.0
+    ph = (phase + LEG_PHASE) % 1.0
+
+    T_st = IK_DUTY * cyc
+    vx_i = vx - yaw * LEG_Y
+    vy_i = vy + yaw * LEG_X
+    stride_x = np.clip(vx_i * T_st * IK_STRIDE_GAIN, -IK_MAX_STEP, IK_MAX_STEP)
+    stride_y = np.clip(vy_i * T_st * IK_STRIDE_GAIN, -IK_MAX_STEP, IK_MAX_STEP)
+
+    stance = ph < IK_DUTY
+    fr_st = ph / IK_DUTY
+    fr_sw = (ph - IK_DUTY) / (1.0 - IK_DUTY)
+    s_sw = 0.5 - 0.5 * np.cos(np.pi * fr_sw)
+    off_x = np.where(stance, stride_x * (0.5 - fr_st),
+                     stride_x * (-0.5 + s_sw))
+    off_y = np.where(stance, stride_y * (0.5 - fr_st),
+                     stride_y * (-0.5 + s_sw))
+    lift = np.where(stance, 0.0, amp * IK_LIFT * np.sin(np.pi * fr_sw))
+
+    x_t = FOOT_X_NOM + off_x
+    y_t = THIGH_Y + off_y
+    z_t = FOOT_Z_NOM + lift
+
+    ay = np.sqrt(np.maximum(y_t * y_t + z_t * z_t - THIGH_Y ** 2, 1e-6))
+    z_leg = -ay
+    q_hip = np.arctan2(z_t, y_t) - np.arctan2(z_leg, THIGH_Y)
+    q_thigh, q_calf = _ik_planar_np(x_t, z_leg)
+    q = np.stack([q_hip, q_thigh, q_calf], axis=-1).reshape(12)
+    return q - Q_DEFAULT_NEW
+
+
+def gait_for(gait_type: str, step: int, cmd) -> np.ndarray:
+    return gait_ik_np(step, cmd) if gait_type == "ik" else gait_np(step, cmd)
+
+
 # ---------------------------------------------------------------- 策略
 class StudentNpz:
     def __init__(self, path):
@@ -515,6 +579,7 @@ class Runner:
         print(f" 输入源={args.input}  目标 vx={args.vx:+.2f}  最长 {args.duration:.0f}s  "
               f"kp={kp_target:.0f}")
         print(f" 策略 {args.npz}")
+        print(f" 基准步态 = {args.gait_type}（必须与训练的 --gait_mode 一致）")
         print(" 按键：Enter 推进 / w·a 切换走停 / s 停 / q 结束（RUN 中=q 停车）")
         if args.input == "pad":
             print(f"       手柄按住按钮 {args.pad_button} 走，松开停")
@@ -722,7 +787,7 @@ class Runner:
                         a = np.clip(self.policy.act(obs), -1.0, 1.0)
                         a = self.last_action + np.clip(a - self.last_action, -0.15, 0.15)
                         self.last_action = a.copy()
-                        g = gait_np(self.step, cmd)
+                        g = gait_for(args.gait_type, self.step, cmd)
                         q_des_sim = np.clip(Q_DEFAULT_NEW + g
                                             + 0.2 * args.action_scale * a,
                                             JNT_LO, JNT_HI)
@@ -797,6 +862,10 @@ def main():
     g.add_argument("--go", action="store_true", help="真实运行")
     ap.add_argument("--input", choices=["key", "pad"], default="key",
                     help="key=键盘（默认）/ pad=手柄 deadman")
+    ap.add_argument("--gait-type", choices=["sine", "ik"], default="ik",
+                    help="基准步态类型，**必须与训练时 --gait_mode 一致**。"
+                         "2026-10-28 起训练默认 ik（正弦步态的推进方向由触地时序"
+                         "涌现，实机会反向）；旧 checkpoint 用 sine")
     ap.add_argument("--pad-button", type=int, default=0, help="手柄按钮编号（默认 0）")
     ap.add_argument("--npz",
                     default=str(REPO_ROOT / "checkpoints" / "dog_cmd_mjx_student.npz"))
