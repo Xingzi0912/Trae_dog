@@ -439,6 +439,7 @@ class Runner:
         self.q_dev = float("nan")
         self.g_corr = np.eye(3)      # IMU 校平矩阵（站立时把 g_b 归到 [0,0,-1]）
         self.g_raw_stand = None
+        self.run_log = []            # RUN 段逐帧 (q_des_sim, q_sim, action, tau)
         self.dist_x = 0.0
         self.dist_y = 0.0
         self.t_move = 0.0
@@ -464,6 +465,38 @@ class Runner:
                 tau[i] = fb.get("tau", 0.0)
                 fresh += 1
         return q, dq, tau, fresh
+
+    def _report_run_log(self):
+        """打印 RUN 段每关节的指令行程 vs 实测行程（峰值-峰值）
+
+        用途：实机 2026-10-28 观察"前脚步幅比后脚大"，此表把"指令侧就小"
+        和"指令一样但跟不动"区分开——前者是步态问题，后者是负载/PD 问题。
+        """
+        if not self.run_log:
+            return
+        n = len(self.run_log)
+        names = [f"{L}_{J}" for L in ("FL", "FR", "RL", "RR")
+                 for J in ("hip", "thigh", "calf")]
+        qd = np.array([r[0] for r in self.run_log])   # (n,12) sim 系目标
+        qm = np.array([r[1] for r in self.run_log])   # (n,12) sim 系实测
+        aa = np.array([r[2] for r in self.run_log])
+        tt = np.array([r[3] for r in self.run_log])
+        ppd = qd.max(axis=0) - qd.min(axis=0)
+        ppm = qm.max(axis=0) - qm.min(axis=0)
+        print(f"\n=== RUN 段关节行程对照（{n} 帧，峰值-峰值 rad）===")
+        print(f"{'关节':<10}{'指令':>9}{'实测':>9}{'跟踪':>8}{'|a|':>7}{'|tau|max':>10}")
+        for i, nm in enumerate(names):
+            ratio = ppm[i] / ppd[i] if ppd[i] > 1e-6 else float("nan")
+            print(f"{nm:<10}{ppd[i]:>9.4f}{ppm[i]:>9.4f}{ratio:>8.2f}"
+                  f"{np.mean(np.abs(aa[:, i])):>7.2f}"
+                  f"{np.nanmax(np.abs(tt[:, i])):>10.1f}")
+        # 前腿(0-5) vs 后腿(6-11) 的膝/大腿行程
+        idx_f = [1, 2, 4, 5]
+        idx_r = [7, 8, 10, 11]
+        print(f"  前腿 thigh+calf 指令行程均值 {ppd[idx_f].mean():.4f} / 实测 {ppm[idx_f].mean():.4f}")
+        print(f"  后腿 thigh+calf 指令行程均值 {ppd[idx_r].mean():.4f} / 实测 {ppm[idx_r].mean():.4f}")
+        print("  判读：指令侧前后一样 → 步态对称；实测后腿明显小 → 后腿负载/PD 跟不上")
+        print("        有效残差 |a| 应接近 0.3~0.5（与仿真一致）；明显偏小说明策略没出力")
 
     def limp_and_disable(self, bus):
         """软停：先用 kp=kd=tau=0 连发（DISABLE 丢帧也能让腿松），再失能并验证"""
@@ -893,6 +926,13 @@ class Runner:
                         self.dist_y += lin_b[1] * DT
                         if self.vx_eff > 0.02:
                             self.t_move += DT
+                        # 记录 RUN 段逐帧数据，退出时打印关节行程对照
+                        self.run_log.append((
+                            np.array(q_des_sim, dtype=np.float64),
+                            np.array(q_sim, dtype=np.float64),
+                            np.array(a, dtype=np.float64),
+                            np.array(tau, dtype=np.float64),
+                        ))
                         if self.step % 25 == 0:
                             print(f"    t={self.step * DT:5.1f}s vx={self.vx_eff:+.2f} "
                                   f"z={self.base_z:.3f} "
@@ -930,6 +970,7 @@ class Runner:
             print("\n\n!!! 异常退出 !!!")
             traceback.print_exc()
         finally:
+            self._report_run_log()
             keys.close()
             if self.pad is not None:
                 self.pad.close()
