@@ -248,15 +248,18 @@ def gait_for(gait_type: str, step: int, cmd, phase: float = 0.0) -> np.ndarray:
             else gait_np(step, cmd))
 
 
-def set_ik_params(lift=None, duty=None, gain=None) -> None:
+def set_ik_params(lift=None, duty=None, gain=None, freq=None) -> None:
     """运行时覆盖 IK 步态参数（必须在第一次调用 gait_for 之前调）"""
-    global IK_LIFT, IK_DUTY, IK_STRIDE_GAIN
+    global IK_LIFT, IK_DUTY, IK_STRIDE_GAIN, FREQ_MIN, FREQ_MAX
     if lift is not None:
         IK_LIFT = float(lift)
     if duty is not None:
         IK_DUTY = float(duty)
     if gain is not None:
         IK_STRIDE_GAIN = float(gain)
+    if freq is not None:
+        # 固定步频（覆盖随速度变化的映射），用于肉眼观察足端轨迹
+        FREQ_MIN = FREQ_MAX = float(freq)
 
 
 # ---------------------------------------------------------------- 策略
@@ -644,8 +647,10 @@ class Runner:
         print(f" 策略 {args.npz}")
         print(f" 基准步态 = {args.gait_type}（必须与训练的 --gait_mode 一致）")
         if args.gait_type == "ik":
+            _hz = (f"{FREQ_MIN:.2f}Hz(固定)" if FREQ_MIN == FREQ_MAX
+                   else f"{FREQ_MIN:.1f}~{FREQ_MAX:.1f}Hz")
             print(f"   IK 参数：lift={IK_LIFT*1000:.0f}mm duty={IK_DUTY:.2f} "
-                  f"gain={IK_STRIDE_GAIN:.2f}")
+                  f"gain={IK_STRIDE_GAIN:.2f} freq={_hz}")
         print(" 按键：Enter 推进 / w·a 切换走停 / s 停 / q 结束（RUN 中=q 停车）")
         if args.input == "pad":
             print(f"       手柄按住按钮 {args.pad_button} 走，松开停")
@@ -978,6 +983,9 @@ def main():
                     help="覆盖 IK 支撑相占比（默认 %.2f）。调大可延长蹬地时间" % IK_DUTY)
     ap.add_argument("--ik-gain", type=float, default=None,
                     help="覆盖 IK 步幅标定系数（默认 %.2f）。调大=步幅更大" % IK_STRIDE_GAIN)
+    ap.add_argument("--ik-freq", type=float, default=None,
+                    help="固定步频（Hz），覆盖随速度变化的 2~4Hz 映射。"
+                         "降到 0.5~0.8 可肉眼观察足端轨迹是前后划还是上下点")
     ap.add_argument("--pad-button", type=int, default=0, help="手柄按钮编号（默认 0）")
     ap.add_argument("--npz",
                     default=str(REPO_ROOT / "checkpoints" / "dog_cmd_mjx_student.npz"))
@@ -1010,7 +1018,8 @@ def main():
     if not Path(args.npz).exists():
         sys.exit(f"找不到部署包 {args.npz}")
     # 运行时覆盖 IK 步态参数（必须在任何 gait_for 调用之前）
-    set_ik_params(lift=args.ik_lift, duty=args.ik_duty, gain=args.ik_gain)
+    set_ik_params(lift=args.ik_lift, duty=args.ik_duty, gain=args.ik_gain,
+                  freq=args.ik_freq)
     Runner(args).run()
 
 
