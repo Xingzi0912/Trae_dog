@@ -152,13 +152,14 @@ def run_plan(policy, env, plan, seed=0):
         c = jnp.array([cmd], dtype=jnp.float32)
         p0 = np.asarray(st.dx.qpos[0, 0:3]).copy()
         yaw_a = yaw0 if not rows else rows[-1]["yaw_end"]
-        vx_l, vy_l, wz_l, z_l = [], [], [], []
+        vx_l, vy_l, wz_l, z_l, a_l = [], [], [], [], []
         fell = None
         for i in range(n):
             st = st._replace(command=c)
             priv = env.get_privileged_obs(st)
             act = policy.action(obs, priv)
             act = jnp.clip(act, -1.0, 1.0)
+            a_l.append(float(jnp.mean(jnp.abs(act))))
             st, obs, rew, term, trunc, info = step_fn(st, act, mx)
             vx_l.append(float(info["lin_vel_b"][0, 0]))
             vy_l.append(float(info["lin_vel_b"][0, 1]))
@@ -175,6 +176,7 @@ def run_plan(policy, env, plan, seed=0):
             "name": name, "cmd": cmd, "steps": n_done, "fell": fell,
             "vx": float(np.mean(vx_l)), "vy": float(np.mean(vy_l)),
             "wz": float(np.mean(wz_l)), "z": float(np.mean(z_l)),
+            "act": float(np.mean(a_l)) if a_l else 0.0,
             "dx": dx, "dy": dy,
             "yaw_end": yaw_now,
             "dheading": float(np.degrees(yaw_now - yaw_a)),
@@ -187,8 +189,8 @@ def run_plan(policy, env, plan, seed=0):
 def report(rows, policy_name):
     print(f"\n=== {policy_name} ===")
     print(f"{'段':<9}{'指令(vx,vy,yaw)':>20}{'实测(机身系)':>26}{'世界位移':>18}"
-          f"{'直线度':>9}{'航向漂':>8}{'z':>7}{'结果':>8}")
-    print("-" * 118)
+          f"{'直线度':>9}{'航向漂':>8}{'z':>7}{'|a|':>6}{'结果':>8}")
+    print("-" * 124)
     for r in rows:
         c = r["cmd"]
         straight = (r["dy"] / r["dx"]) if abs(r["dx"]) > 1e-3 else float("nan")
@@ -197,8 +199,9 @@ def report(rows, policy_name):
         pos_s = "{:+.2f}/{:+.2f}".format(r["dx"], r["dy"])
         res_s = ("摔@%d" % r["fell"]) if r["fell"] else "存活"
         print(f"{r['name']:<9}{cmd_s:>20}{meas_s:>26}{pos_s:>18}"
-              f"{straight:>9.3f}{r['dheading']:>8.1f}{r['z']:>7.3f}{res_s:>8}")
-    print("-" * 118)
+              f"{straight:>9.3f}{r['dheading']:>8.1f}{r['z']:>7.3f}"
+              f"{r.get('act', 0.0):>6.2f}{res_s:>8}")
+    print("-" * 124)
     print("判读：纯前进段的 dy/dx 应 <0.05、航向漂 <3°；vx 应贴近指令。")
 
 
