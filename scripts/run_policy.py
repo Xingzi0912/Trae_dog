@@ -852,6 +852,16 @@ class Runner:
                 print("⚠ 失能未确认！请看上面的红色警告。")
             sys.stdout.flush()
             sys.stderr.flush()
+            # 退出前显式关掉鼠标上报 + 复位光标：
+            # 某些终端/SDL 会开启 mouse-tracking，而 os._exit 跳过一切清理，
+            # 结果终端把滚轮事件当字符回显（"\e[<64;42;8M"）且滚轮失效。
+            # 这里主动发一遍复位序列，保证 shell 恢复可用。
+            try:
+                sys.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l"
+                                 "\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?25h")
+                sys.stdout.flush()
+            except Exception:
+                pass
             os._exit(0)
 
 
