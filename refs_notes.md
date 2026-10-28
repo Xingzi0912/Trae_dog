@@ -59,3 +59,39 @@
 - 摩擦/背隙处理：?
 - **可直接借鉴的**：
 - **不适用于我们的**：
+
+### My_unitree_go2_gym（于松民）— https://github.com/yusongmin1/My_unitree_go2_gym
+
+- 克隆到：`refs/My_unitree_go2_gym`（blobless + sparse，只取 .py，未下 resources/logs）
+- 读了：`legged_gym/envs/Go2_MoB/Go2_Trot/Go2_Trot_Config.py`、
+  `deploy_mujoco/sim2sim_go2_trot.py`、README
+- 硬件：Unitree Go2（15 kg），12 关节，峰值 45 N·m；**Isaac Gym + rsl_rl**
+- 控制：软件算 PD 力矩再 `clip(±45 N·m)`，`data.ctrl = tau`；
+  kp=20 / kd=0.5（全关节）；action_scale=0.25，`target_q = action × 0.25`
+- 步态：**不写基准步态**，把相位 `sin/cos(2πt/0.5s)` 喂进观测让策略自己学；
+  奖励塑造：trot +0.8、feet_clearance +0.1、default_hip_pos −0.2、
+  default_pos −0.1、base_height −5（目标 0.29 m）；抬脚目标 0.06 m
+- 观测：47 维单帧 × **frame_stack=10** = 470 维；**actor 里没有机身线速度**，
+  只有 omega、euler、q−q0、dq、上一步 action；48 维不包含 base_lin_vel
+- DR（很完整）：摩擦 [0.2,1.2]、base 质量 [−1,+2] kg、连杆质量 ×[0.9,1.1]、
+  **base CoM ±0.03 m**、kp/kd ×[0.9,1.1]、**电机零位 ±0.035 rad**、
+  **motor/IMU 观测延迟各 1~3 步**、**action 延迟 1~3 步**
+- 默认站姿：四条腿完全相同 [0, 0.8, −1.5]（天然对称）
+- 他们的 TODO 与我们高度重合：走歪、低速度跟踪不好、行走基座晃动、
+  四条腿抬脚高度/时间不一致（去掉 feet_air_time 奖励后趋于一致）
+
+**可直接借鉴（按性价比）**
+1. 观测加步态相位 sin/cos（我们已有 EnvState.gait_phase，加 2 维即可）
+2. actor 观测去掉 FK 线速度 v_b（打滑时是 ±0.3 噪声）
+3. 观测加历史帧（他们 10 帧；我们先用 3 帧，NUC numpy 推理不能太大）
+4. 电机零位随机化 ±0.035 rad（我们的站姿是手摆的，误差正是这个量级）
+5. 观测延迟随机化（motor/IMU 各 1~3 步）
+6. base CoM 随机化 ±0.03 m（我们电池位置不确定）
+7. 摩擦 DR 放宽到 [0.2, 1.2]（更悲观）
+8. 力矩上限 45 N·m 直接写进模型（我们是 28 的软件保护）
+
+**不适用**
+- kp=20 / kd=0.5：DM 电机 kp=60 都腿软站不住（用户实测），必须 150
+- 力矩接口：DM 走位置控制（MIT 模式），不用 tau_ff
+- Isaac Gym + rsl_rl：我们用 MJX + 自写 PPO
+- 470 维观测：NUC 的 numpy 推理要控规模，先 3 帧（183 维）
