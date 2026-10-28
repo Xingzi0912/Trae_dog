@@ -100,12 +100,16 @@ def main() -> None:
                     help="覆盖 IK 支撑相步幅上限（默认 %.2f m）" % G.IK_MAX_STEP)
     ap.add_argument("--freq_max", type=float, default=None,
                     help="覆盖步频上限（默认 %.1f Hz）" % G.FREQ_MAX)
+    ap.add_argument("--stride_gain", type=float, default=None,
+                    help="覆盖 IK 规划步幅的标定系数（默认 %.2f）。"
+                         "调大 = 步幅更大（对抗打滑），过大会失稳" % G.IK_STRIDE_GAIN)
     args = ap.parse_args()
 
     # 步态常量必须在首次 step（JIT trace）之前写入
     for name, val in (("IK_LIFT", args.lift), ("IK_DUTY", args.duty),
                       ("IK_MAX_STEP", args.max_step),
-                      ("FREQ_MAX", args.freq_max)):
+                      ("FREQ_MAX", args.freq_max),
+                      ("IK_STRIDE_GAIN", args.stride_gain)):
         if val is not None:
             setattr(G, name, val)
 

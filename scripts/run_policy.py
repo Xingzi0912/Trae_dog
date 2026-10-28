@@ -144,7 +144,7 @@ LEG_X = np.array([0.22337, 0.22337, -0.22337, -0.22337])
 LEG_Y = np.array([0.1639, -0.1639, 0.1639, -0.1639])
 THIGH_Y = np.array([THIGH_Y_OFF, -THIGH_Y_OFF, THIGH_Y_OFF, -THIGH_Y_OFF])
 LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])
-IK_DUTY, IK_LIFT, IK_MAX_STEP, IK_STRIDE_GAIN = 0.62, 0.035, 0.20, 1.0
+IK_DUTY, IK_LIFT, IK_MAX_STEP, IK_STRIDE_GAIN = 0.55, 0.06, 0.20, 1.0
 
 
 def _foot_nom_from_q(q1, q2):
