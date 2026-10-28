@@ -36,3 +36,6 @@ MJDATA.TXT
 # OS
 .DS_Store
 Thumbs.db
+
+# 外部参考实现（他人仓库，不纳入本仓库版本管理）
+refs/
