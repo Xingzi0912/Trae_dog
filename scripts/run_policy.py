@@ -112,6 +112,23 @@ def quat_to_mat(q) -> np.ndarray:
         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
 
 
+def rot_between(a, b) -> np.ndarray:
+    """把单位向量 a 旋到 b 的最小旋转（Rodrigues）"""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = a / max(np.linalg.norm(a), 1e-9)
+    b = b / max(np.linalg.norm(b), 1e-9)
+    v = np.cross(a, b)
+    c = float(np.dot(a, b))
+    s = float(np.linalg.norm(v))
+    if s < 1e-9:
+        return np.eye(3)
+    K = np.array([[0.0, -v[2], v[1]],
+                  [v[2], 0.0, -v[0]],
+                  [-v[1], v[0], 0.0]])
+    return np.eye(3) + K + K @ K * ((1.0 - c) / (s * s))
+
+
 def gait_np(step: int, cmd) -> np.ndarray:
     """与 envs/gait.py 逐位对齐（对拍偏差 <1e-6 rad）"""
     vx, vy, yaw = float(cmd[0]), float(cmd[1]), float(cmd[2])
@@ -406,6 +423,8 @@ class Runner:
         self.last_walking = False
         self.q_sim = np.zeros(12)
         self.q_dev = float("nan")
+        self.g_corr = np.eye(3)      # IMU 校平矩阵（站立时把 g_b 归到 [0,0,-1]）
+        self.g_raw_stand = None
         self.dist_x = 0.0
         self.dist_y = 0.0
         self.t_move = 0.0
@@ -802,10 +821,28 @@ class Runner:
                         rpy = quat_to_rpy(qua)
                         R = quat_to_mat(qua)
                         g_b = -R[2, :]
+                        # IMU 校平：把站立时的恒定倾斜（实际是 IMU 装歪）旋掉，
+                        # 让策略看到的 g_b 与仿真一致（站立 = [0,0,-1]）
+                        if args.level_imu:
+                            g_b = self.g_corr @ g_b
                     else:
                         rpy, R, g_b = np.zeros(3), np.eye(3), np.array([0.0, 0.0, -1.0])
                     if gyr is None:
                         gyr = np.zeros(3)
+                    if args.level_imu:
+                        gyr = self.g_corr @ gyr
+                    # 站稳后（WAIT_RUN = 起立完成 + 静置 2 秒之后）标定 IMU 校平矩阵
+                    if (args.level_imu and self.g_raw_stand is None
+                            and phase == "WAIT_RUN"):
+                        self.g_raw_stand = g_b.copy()
+                        self.g_corr = rot_between(self.g_raw_stand,
+                                                  np.array([0.0, 0.0, -1.0]))
+                        tilt = np.degrees(np.arccos(np.clip(
+                            -float(self.g_raw_stand[2]), -1.0, 1.0)))
+                        print(f"    IMU 校平：实测站立 g_b={np.round(self.g_raw_stand, 3)}"
+                              f"  倾斜 {tilt:.1f}° → 已旋到 [0,0,-1]")
+                        g_b = self.g_corr @ g_b
+                        gyr = self.g_corr @ gyr
                     contact = self.contact_mask(q_sim, args.contact_margin)
                     self.q_sim = q_sim
                     self.q_dev = float(np.abs(q_sim - Q_DEFAULT_NEW).max())
@@ -914,6 +951,11 @@ def main():
                     help="基准步态类型，**必须与训练时 --gait_mode 一致**。"
                          "2026-10-28 起训练默认 ik（正弦步态的推进方向由触地时序"
                          "涌现，实机会反向）；旧 checkpoint 用 sine")
+    ap.add_argument("--level-imu", action="store_true", default=True,
+                    help="用站立姿态把 IMU 的恒定倾斜旋掉（默认开）。实机实测站姿 "
+                         "g_b=[-0.08,+0.05,-1]，而仿真= [0,0,-1]；这 5° 偏置会让"
+                         "策略看到没训练过的状态、输出变保守（实测 |a| 只有仿真的 1/4）")
+    ap.add_argument("--no-level-imu", dest="level_imu", action="store_false")
     ap.add_argument("--pad-button", type=int, default=0, help="手柄按钮编号（默认 0）")
     ap.add_argument("--npz",
                     default=str(REPO_ROOT / "checkpoints" / "dog_cmd_mjx_student.npz"))
