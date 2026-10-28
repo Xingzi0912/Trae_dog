@@ -53,6 +53,8 @@ VARIANTS = {
                     desc="椭圆锥 condim=6 但滚动摩擦=0"),
     "nobody":  dict(cone=CONE_ELL, imp=100.0, condim=6, roll=0.01, nobody=True,
                     desc="现状 + 关闭机身碰撞体（只留四脚）"),
+    "noself":  dict(cone=CONE_ELL, imp=100.0, condim=6, roll=0.01, noself=True,
+                    desc="现状 + 只关机身自碰撞（机身↔地面/脚仍碰）"),
     "pyr":     dict(cone=CONE_PYR, imp=100.0, condim=6, roll=0.01, nobody=False,
                     desc="金字塔锥 impratio=100 condim=6"),
     "pyr_c3":  dict(cone=CONE_PYR, imp=100.0, condim=3, roll=0.01, nobody=False,
@@ -75,13 +77,24 @@ def load_model(cfg):
         mjm.geom_condim[i] = cfg["condim"]
         if cfg["roll"] != 0.01:
             mjm.geom_friction[i, 2] = cfg["roll"]
-    if cfg["nobody"]:
+    if cfg.get("nobody"):
         for i, n in names.items():
             if i in foot_ids or n == "floor":
                 continue
             if mjm.geom_group[i] == 3:          # 机身碰撞体（多为无名 geom）
                 mjm.geom_contype[i] = 0
                 mjm.geom_conaffinity[i] = 0
+    if cfg.get("noself"):
+        # 机身碰撞体改成 contype=2 / conaffinity=1：
+        #   机身↔机身 = (2&1)=0 || (2&1)=0 → 不碰（这是 290 个废接触的来源）
+        #   机身↔地面 = (2&1)=0 || (1&1)=1 → 碰（保留摔跤检测）
+        #   机身↔脚   = (2&1)=0 || (1&1)=1 → 碰
+        for i, n in names.items():
+            if i in foot_ids or n == "floor":
+                continue
+            if mjm.geom_group[i] == 3:
+                mjm.geom_contype[i] = 2
+                mjm.geom_conaffinity[i] = 1
     return mjm, foot_ids
 
 
