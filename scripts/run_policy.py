@@ -440,6 +440,7 @@ class Runner:
         self.g_corr = np.eye(3)      # IMU 校平矩阵（站立时把 g_b 归到 [0,0,-1]）
         self.g_raw_stand = None
         self.run_log = []            # RUN 段逐帧 (q_des_sim, q_sim, action, tau)
+        self.obs_log = []            # RUN 段逐帧观测（用于与仿真逐维对比）
         self.dist_x = 0.0
         self.dist_y = 0.0
         self.t_move = 0.0
@@ -465,6 +466,37 @@ class Runner:
                 tau[i] = fb.get("tau", 0.0)
                 fresh += 1
         return q, dq, tau, fresh
+
+    def _report_obs_stats(self):
+        """打印 RUN 段观测的逐块均值/标准差（用于与仿真逐维对比）
+
+        观测布局（61 维，2026-10-28 起 46:58 为步态相位块）：
+          0       base_z
+          1:4     g_b（projected gravity）
+          4:7     机身系线速度（实机由 FK 估计，最可疑）
+          7:10    机身系角速度（IMU）
+          10:22   关节角 q_sim
+          22:34   关节速度 dq_sim
+          34:46   last_action
+          46:58   相位 sin/cos + 10 个 0
+          58:61   指令
+        """
+        if not self.obs_log:
+            return
+        O = np.array(self.obs_log)                     # (n,61)
+        blocks = [("base_z", 0, 1), ("g_b", 1, 4), ("lin_b", 4, 7),
+                  ("ang_b", 7, 10), ("q_sim", 10, 22), ("dq_sim", 22, 34),
+                  ("a_prev", 34, 46), ("phase", 46, 48), ("cmd", 58, 61)]
+        print(f"\n=== 观测逐块统计（RUN 段 {len(O)} 帧，用于与仿真对比）===")
+        print(f"{'块':<8}{'维':>4}   mean")
+        for nm, a, b in blocks:
+            m = O[:, a:b].mean(axis=0)
+            s = O[:, a:b].std(axis=0)
+            print(f"{nm:<8}{b - a:>4}   {np.array2string(m, precision=3, max_line_width=200)}")
+            print(f"{'':<8}{'':>4}   std {np.array2string(s, precision=3, max_line_width=200)}")
+        # 单独标出最可疑的几维
+        print("  重点：lin_b 实机=FK 估计（打滑时会 0.3 级乱跳）；"
+              "q_sim 含编码器零位误差；dq_sim 来自差分+低通")
 
     def _report_run_log(self):
         """打印 RUN 段每关节的指令行程 vs 实测行程（峰值-峰值）
@@ -938,6 +970,7 @@ class Runner:
                             np.array(a, dtype=np.float64),
                             np.array(tau, dtype=np.float64),
                         ))
+                        self.obs_log.append(np.array(obs, dtype=np.float64))
                         if self.step % 25 == 0:
                             print(f"    t={self.step * DT:5.1f}s vx={self.vx_eff:+.2f} "
                                   f"z={self.base_z:.3f} "
@@ -976,6 +1009,7 @@ class Runner:
             traceback.print_exc()
         finally:
             self._report_run_log()
+            self._report_obs_stats()
             keys.close()
             if self.pad is not None:
                 self.pad.close()

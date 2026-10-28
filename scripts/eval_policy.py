@@ -153,6 +153,7 @@ def run_plan(policy, env, plan, seed=0):
         p0 = np.asarray(st.dx.qpos[0, 0:3]).copy()
         yaw_a = yaw0 if not rows else rows[-1]["yaw_end"]
         vx_l, vy_l, wz_l, z_l, a_l = [], [], [], [], []
+        obs_l = []
         fell = None
         for i in range(n):
             st = st._replace(command=c)
@@ -160,6 +161,7 @@ def run_plan(policy, env, plan, seed=0):
             act = policy.action(obs, priv)
             act = jnp.clip(act, -1.0, 1.0)
             a_l.append(float(jnp.mean(jnp.abs(act))))
+            obs_l.append(np.asarray(obs[0], dtype=np.float64))
             st, obs, rew, term, trunc, info = step_fn(st, act, mx)
             vx_l.append(float(info["lin_vel_b"][0, 0]))
             vy_l.append(float(info["lin_vel_b"][0, 1]))
@@ -177,6 +179,7 @@ def run_plan(policy, env, plan, seed=0):
             "vx": float(np.mean(vx_l)), "vy": float(np.mean(vy_l)),
             "wz": float(np.mean(wz_l)), "z": float(np.mean(z_l)),
             "act": float(np.mean(a_l)) if a_l else 0.0,
+            "obs": np.array(obs_l) if obs_l else np.zeros((0, 61)),
             "dx": dx, "dy": dy,
             "yaw_end": yaw_now,
             "dheading": float(np.degrees(yaw_now - yaw_a)),
@@ -184,6 +187,23 @@ def run_plan(policy, env, plan, seed=0):
         if fell:
             break
     return rows
+
+
+def report_obs_stats(rows):
+    """与 run_policy.py 的 _report_obs_stats 对齐，用于逐维对比实机/仿真"""
+    BLOCKS = [("base_z", 0, 1), ("g_b", 1, 4), ("lin_b", 4, 7),
+              ("ang_b", 7, 10), ("q_sim", 10, 22), ("dq_sim", 22, 34),
+              ("a_prev", 34, 46), ("phase", 46, 48), ("cmd", 58, 61)]
+    for r in rows:
+        O = r.get("obs")
+        if O is None or len(O) == 0:
+            continue
+        print(f"\n--- 观测逐块统计【仿真】{r['name']}（{len(O)} 帧）---")
+        for nm, a, b in BLOCKS:
+            m = O[:, a:b].mean(axis=0)
+            s = O[:, a:b].std(axis=0)
+            print(f"{nm:<8}{b - a:>4}   {np.array2string(m, precision=3, max_line_width=200)}")
+            print(f"{'':<8}{'':>4}   std {np.array2string(s, precision=3, max_line_width=200)}")
 
 
 def report(rows, policy_name):
@@ -212,6 +232,9 @@ def main():
     g.add_argument("--npz", help="学生部署包（61 维，numpy 前向）")
     g.add_argument("--student", help="学生 Flax checkpoint（61 维）")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--obs-stats", action="store_true",
+                    help="额外打印每段观测的逐块 mean/std，用于与实机"
+                         "run_policy 退出时打印的同一张表逐维对比")
     args = ap.parse_args()
 
     if args.ckpt:
@@ -228,10 +251,14 @@ def main():
     env = make_env()
     rows = run_plan(policy, env, DEFAULT_PLAN, seed=args.seed)
     report(rows, name)
+    if args.obs_stats:
+        report_obs_stats(rows)
 
     out = REPO / "logs" / "eval_policy_last.json"
     out.parent.mkdir(exist_ok=True)
-    out.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    rows_json = [{k: v for k, v in r.items() if k != "obs"} for r in rows]
+    out.write_text(json.dumps(rows_json, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
     print(f"\n明细已存 {out}")
 
 
