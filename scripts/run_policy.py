@@ -516,12 +516,15 @@ class Runner:
         ppd = qd.max(axis=0) - qd.min(axis=0)
         ppm = qm.max(axis=0) - qm.min(axis=0)
         print(f"\n=== RUN 段关节行程对照（{n} 帧，峰值-峰值 rad）===")
-        print(f"{'关节':<10}{'指令':>9}{'实测':>9}{'跟踪':>8}{'|a|':>7}{'|tau|max':>10}")
+        print(f"{'关节':<10}{'指令':>9}{'实测':>9}{'跟踪':>8}{'|a|':>7}"
+              f"{'tau_mean':>10}{'|tau|max':>10}")
         for i, nm in enumerate(names):
             ratio = ppm[i] / ppd[i] if ppd[i] > 1e-6 else float("nan")
             print(f"{nm:<10}{ppd[i]:>9.4f}{ppm[i]:>9.4f}{ratio:>8.2f}"
                   f"{np.mean(np.abs(aa[:, i])):>7.2f}"
+                  f"{np.nanmean(tt[:, i]):>10.2f}"
                   f"{np.nanmax(np.abs(tt[:, i])):>10.1f}")
+        print("  tau_mean 是带符号的均值：**站着不动时读它 = 该关节的静态重力力矩**")
         # 前腿(0-5) vs 后腿(6-11) 的膝/大腿行程
         idx_f = [1, 2, 4, 5]
         idx_r = [7, 8, 10, 11]
