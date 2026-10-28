@@ -11,6 +11,12 @@
     4. 足端【保留 condim=6】：3.13 实测支持（站立 base_z 0.2722，比 condim=3
        的 0.2744 更贴近原模型 0.2725；滚动摩擦 0.01 虽小但不丢）
     5. 删除 sensor 段（MJX 训练不用，obs 直接从 data 构造）
+    6. 【2026-10-28 性能】机身碰撞体全部关闭（contype/conaffinity=0），只留四脚。
+       实测机身碰撞体之间产生约 290+38 个接触（相邻连杆碰撞盒在关节处重叠），
+       对站立/行走动力学零贡献（base_z 与关节角完全不变），却让 ncon 从 10 涨到
+       300、单步慢 3.24 倍。环境里 contact[4] 是几何法（foot_z<0.05）算的、
+       终止条件用 base_z，均不依赖物理接触，故关闭无功能损失。
+       代价：摔倒时机身会穿过地面（但 base_z<0.25 早已终止该 episode）。
   put_model 零 warning：frictionloss/margin/actuatorfrcrange 3.13 均原生支持。
   mesh 全为纯视觉（contype=0），碰撞全是基本体。
   ============================================================ -->
@@ -39,9 +45,9 @@
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
       </default>
       <default class="collision">
-        <geom group="3" contype="2" conaffinity="1"/>
+        <geom group="3" contype="0" conaffinity="0"/>
         <default class="foot">
-          <geom size="0.022" pos="-0.002 0 -0.213" priority="1" condim="6" friction="0.9 0.02 0.01"/>
+          <geom size="0.022" pos="-0.002 0 -0.213" priority="1" condim="6" friction="0.9 0.02 0.01" contype="2" conaffinity="1"/>
         </default>
       </default>
     </default>
