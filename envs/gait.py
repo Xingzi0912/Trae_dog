@@ -81,6 +81,24 @@ L2 = 0.24               # 膝→脚连杆长（m）
 # gait_ik(零指令) ≈ 0。
 FOOT_X_NOM = 0.008037     # 脚端相对 hip 关节的 x（新站立位，FK 实测均值）
 FOOT_Z_NOM = -0.302601    # 同上 z
+
+
+def _foot_nom_from_q(q1: float, q2: float):
+    """由绝对关节角 (thigh, calf) 反算二维平面脚位（与 _ik_planar 互逆）"""
+    x = -(L1 * np.sin(q1) + L2 * np.sin(q1 + q2))
+    z = -(L1 * np.cos(q1) + L2 * np.cos(q1 + q2))
+    return x, z
+
+
+# v26（2026-10-28 实机）：零指令时 IK 不是精确 0，最大偏 0.034 rad，导致站姿被压低
+# 1.3cm（实测 z 0.318→0.305）。后果是整条步态的**脚高基准偏低**：支撑相脚去踩
+# "比真实地面低 1.3cm"的位置 → 腿被压 → PD 猛顶 → 身体上下弹跳（实测 z 在
+# 0.298~0.343 跳），水平推力被弹跳吃掉，表现为"原地跳不前进"。
+# 修法：每条腿用**自己**的 q_default 反算名义脚位，而不是四脚均值。
+FOOT_X_LEG = np.array([_foot_nom_from_q(Q_DEFAULT[3 * i + 1], Q_DEFAULT[3 * i + 2])[0]
+                       for i in range(4)])
+FOOT_Z_LEG = np.array([_foot_nom_from_q(Q_DEFAULT[3 * i + 1], Q_DEFAULT[3 * i + 2])[1]
+                       for i in range(4)])
 THIGH_Y_OFF = 0.1039    # thigh 关节相对 hip 关节的横向偏移
 LEG_X = np.array([0.22337, 0.22337, -0.22337, -0.22337])   # 脚在 body 系 x
 LEG_Y = np.array([0.1639, -0.1639, 0.1639, -0.1639])       # 脚在 body 系 y
@@ -145,10 +163,10 @@ def gait_ik(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     lift = jnp.where(stance, 0.0,
                      amp[..., None] * IK_LIFT * jnp.sin(jnp.pi * fr_sw))
 
-    # 目标脚位（相对 hip 关节）
-    x_t = FOOT_X_NOM + off_x
+    # 目标脚位（相对 hip 关节）：用每腿自己的名义脚位，保证零指令精确为 0
+    x_t = FOOT_X_LEG + off_x
     y_t = THIGH_Y + off_y
-    z_t = FOOT_Z_NOM + lift
+    z_t = FOOT_Z_LEG + lift
 
     # hip 转角把腿平面旋到目标横向，剩余平面内用 2 连杆 IK
     ay = jnp.sqrt(jnp.maximum(y_t * y_t + z_t * z_t

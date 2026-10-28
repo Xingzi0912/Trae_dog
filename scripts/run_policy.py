@@ -147,6 +147,21 @@ LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])
 IK_DUTY, IK_LIFT, IK_MAX_STEP, IK_STRIDE_GAIN = 0.55, 0.06, 0.20, 1.0
 
 
+def _foot_nom_from_q(q1, q2):
+    """由绝对关节角 (thigh, calf) 反算二维平面脚位（与 _ik_planar 互逆）"""
+    x = -(L1 * np.sin(q1) + L2 * np.sin(q1 + q2))
+    z = -(L1 * np.cos(q1) + L2 * np.cos(q1 + q2))
+    return x, z
+
+
+# 2026-10-28：每条腿用自己的 q_default 反算名义脚位（不是四脚均值）。
+# 用均值会让零指令压低站姿 1.3cm，进而使整条步态的脚高基准偏低 → 实机上下弹跳。
+FOOT_X_LEG = np.array([_foot_nom_from_q(Q_DEFAULT_NEW[3 * i + 1],
+                                        Q_DEFAULT_NEW[3 * i + 2])[0] for i in range(4)])
+FOOT_Z_LEG = np.array([_foot_nom_from_q(Q_DEFAULT_NEW[3 * i + 1],
+                                        Q_DEFAULT_NEW[3 * i + 2])[1] for i in range(4)])
+
+
 def _ik_planar_np(x, z):
     r2 = np.maximum(x * x + z * z, 1e-6)
     c2 = np.clip((r2 - L1 * L1 - L2 * L2) / (2.0 * L1 * L2), -1.0, 1.0)
@@ -182,9 +197,9 @@ def gait_ik_np(step: int, cmd) -> np.ndarray:
                      stride_y * (-0.5 + s_sw))
     lift = np.where(stance, 0.0, amp * IK_LIFT * np.sin(np.pi * fr_sw))
 
-    x_t = FOOT_X_NOM + off_x
+    x_t = FOOT_X_LEG + off_x
     y_t = THIGH_Y + off_y
-    z_t = FOOT_Z_NOM + lift
+    z_t = FOOT_Z_LEG + lift
 
     ay = np.sqrt(np.maximum(y_t * y_t + z_t * z_t - THIGH_Y ** 2, 1e-6))
     z_leg = -ay
