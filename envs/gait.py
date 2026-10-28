@@ -90,6 +90,12 @@ LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])                 # 对角 trot
 IK_DUTY = 0.55          # 支撑相占比
 IK_LIFT = 0.06          # 摆动抬脚高度（m）
 IK_MAX_STEP = 0.20      # 支撑相脚位移上限（m），防目标超出腿长
+# v26（2026-10-28）：IK 规划的步幅在仿真里只兑现 44%（0.3 指令 → 实测 0.132 m/s），
+# 原因是 PD 静差 + 支撑相打滑吃掉了步幅。这个固定损失不能靠残差补——实测残差
+# 在 vx 0~0.5 全程顶到 ±1 饱和（A=88~92%），训练直接崩。
+# 因此把标定系数乘进规划步幅：实测 44% → 取 1/0.44 ≈ 2.3。
+# 上线前用 `probe_gait.py --mode ik` 复核 fwd_0.3 的 vx_eff 是否接近 0.3。
+IK_STRIDE_GAIN = 2.3
 
 
 def _ik_planar(x, z):
@@ -121,8 +127,10 @@ def gait_ik(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     T_st = IK_DUTY * cyc
     vx_i = vx[..., None] - yaw[..., None] * LEG_Y
     vy_i = vy[..., None] + yaw[..., None] * LEG_X
-    stride_x = jnp.clip(vx_i * T_st[..., None], -IK_MAX_STEP, IK_MAX_STEP)
-    stride_y = jnp.clip(vy_i * T_st[..., None], -IK_MAX_STEP, IK_MAX_STEP)
+    stride_x = jnp.clip(vx_i * T_st[..., None] * IK_STRIDE_GAIN,
+                        -IK_MAX_STEP, IK_MAX_STEP)
+    stride_y = jnp.clip(vy_i * T_st[..., None] * IK_STRIDE_GAIN,
+                        -IK_MAX_STEP, IK_MAX_STEP)
 
     stance = ph < IK_DUTY
     fr_st = ph / IK_DUTY
