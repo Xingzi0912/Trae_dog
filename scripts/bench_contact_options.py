@@ -36,51 +36,75 @@ if str(ROOT) not in sys.path:
 SCENE = ROOT / "envs" / "scene_mjx.xml"
 CONE_PYR, CONE_ELL = 0, 1          # mjCONE_PYRAMIDAL / mjCONE_ELLIPTIC
 
-# 变体： (cone, impratio, condim, rolling_friction, 说明)
+# 变体：dict(cone, imp, condim, roll, nobody, desc)
+#   nobody=True → 关掉机身碰撞体（group=3 的非足 geoms）的 contype/conaffinity。
+#   动机：ngeom=39 里大部分是机身碰撞体，它们与地面的接触对在站立/行走时
+#   毫无用处（只用 base_z 判摔），却要让求解器每次迭代一遍。
 VARIANTS = {
-    "base":      (CONE_ELL, 100.0, 6, 0.01, "现状：椭圆锥 impratio=100 condim=6"),
-    "imp10":     (CONE_ELL, 10.0,  6, 0.01, "椭圆锥 impratio=10"),
-    "imp1":      (CONE_ELL, 1.0,   6, 0.01, "椭圆锥 impratio=1（各向同性）"),
-    "condim3":   (CONE_ELL, 100.0, 3, 0.01, "椭圆锥 condim=3（去掉扭转/滚动摩擦）"),
-    "noroll":    (CONE_ELL, 100.0, 6, 0.0,  "椭圆锥 condim=6 但滚动摩擦=0"),
-    "pyr":       (CONE_PYR, 100.0, 6, 0.01, "金字塔锥 impratio=100 condim=6"),
-    "pyr_c3":    (CONE_PYR, 100.0, 3, 0.01, "金字塔锥 condim=3"),
-    "fast":      (CONE_PYR, 1.0,   3, 0.0,  "金字塔锥+impratio=1+condim=3+无滚动（最激进）"),
+    "base":    dict(cone=CONE_ELL, imp=100.0, condim=6, roll=0.01, nobody=False,
+                    desc="现状：椭圆锥 impratio=100 condim=6"),
+    "imp10":   dict(cone=CONE_ELL, imp=10.0, condim=6, roll=0.01, nobody=False,
+                    desc="椭圆锥 impratio=10"),
+    "imp1":    dict(cone=CONE_ELL, imp=1.0, condim=6, roll=0.01, nobody=False,
+                    desc="椭圆锥 impratio=1（各向同性）"),
+    "condim3": dict(cone=CONE_ELL, imp=100.0, condim=3, roll=0.01, nobody=False,
+                    desc="椭圆锥 condim=3（去掉扭转/滚动摩擦）"),
+    "noroll":  dict(cone=CONE_ELL, imp=100.0, condim=6, roll=0.0, nobody=False,
+                    desc="椭圆锥 condim=6 但滚动摩擦=0"),
+    "nobody":  dict(cone=CONE_ELL, imp=100.0, condim=6, roll=0.01, nobody=True,
+                    desc="现状 + 关闭机身碰撞体（只留四脚）"),
+    "pyr":     dict(cone=CONE_PYR, imp=100.0, condim=6, roll=0.01, nobody=False,
+                    desc="金字塔锥 impratio=100 condim=6"),
+    "pyr_c3":  dict(cone=CONE_PYR, imp=100.0, condim=3, roll=0.01, nobody=False,
+                    desc="金字塔锥 condim=3"),
+    "fast":    dict(cone=CONE_PYR, imp=1.0, condim=3, roll=0.0, nobody=True,
+                    desc="金字塔锥+imp1+condim3+无滚动+关机身碰撞（最激进）"),
 }
 
 
-def load_model(cone, impratio, condim, roll=0.01):
+def load_model(cfg):
     mjm = mujoco.MjModel.from_xml_path(str(SCENE))
-    mjm.opt.cone = cone
-    mjm.opt.impratio = impratio
-    foot_ids = [i for i in range(mjm.ngeom)
-                if (mujoco.mj_id2name(mjm, mujoco.mjtObj.mjOBJ_GEOM, i) or "").endswith("_foot")]
+    mjm.opt.cone = cfg["cone"]
+    mjm.opt.impratio = cfg["imp"]
+    names = {i: (mujoco.mj_id2name(mjm, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
+             for i in range(mjm.ngeom)}
+    foot_ids = [i for i, n in names.items() if n.endswith("_foot")]
     if not foot_ids:
         raise RuntimeError("找不到 *_foot geom，检查 scene_mjx.xml")
     for i in foot_ids:
-        mjm.geom_condim[i] = condim
-        if roll != 0.01:                 # 只在需要时改，避免浮点噪声
-            mjm.geom_friction[i, 2] = roll
+        mjm.geom_condim[i] = cfg["condim"]
+        if cfg["roll"] != 0.01:
+            mjm.geom_friction[i, 2] = cfg["roll"]
+    if cfg["nobody"]:
+        for i, n in names.items():
+            if i in foot_ids or n == "floor":
+                continue
+            if mjm.geom_group[i] == 3:          # 机身碰撞体（多为无名 geom）
+                mjm.geom_contype[i] = 0
+                mjm.geom_conaffinity[i] = 0
     return mjm, foot_ids
 
 
-def make_batch(mx, n_envs):
-    dx = mjx.make_data(mx)
-    if mx.nkey > 0:
-        qpos = np.asarray(mx.key_qpos[0])
-        ctrl = np.asarray(mx.key_ctrl[0])
+def make_batch(mjm, mx, n_envs):
+    """必须走 put_data 路径：本模型有 condim=1 的机身碰撞体 + condim=6 的脚
+    （elliptic 锥下 mjx.make_data 会直接抛 NotImplementedError），
+    与 envs/dog_env_mjx.py 的 _dx_base 构造方式保持一致。"""
+    mjd = mujoco.MjData(mjm)
+    if mjm.nkey > 0:
+        mujoco.mj_resetDataKeyframe(mjm, mjd, 0)
     else:
-        qpos = np.asarray(mx.qpos0)
-        ctrl = np.zeros(mx.nu)
-    dx = dx.replace(qpos=jnp.asarray(qpos), ctrl=jnp.asarray(ctrl))
+        mujoco.mj_resetData(mjm, mjd)
+    mujoco.mj_forward(mjm, mjd)
+    dx = mjx.put_data(mjm, mjd)
     return jax.tree_util.tree_map(
-        lambda x: jnp.broadcast_to(x, (n_envs,) + x.shape), dx)
+        lambda x: jnp.broadcast_to(jnp.asarray(x, jnp.float32),
+                                   (n_envs,) + jnp.asarray(x).shape), dx)
 
 
-def bench(cone, impratio, condim, roll, n_envs, n_steps, settle):
-    mjm, _ = load_model(cone, impratio, condim, roll)
+def bench(cfg, n_envs, n_steps, settle):
+    mjm, _ = load_model(cfg)
     mx = mjx.put_model(mjm)
-    dx = make_batch(mx, n_envs)
+    dx = make_batch(mjm, mx, n_envs)
     step = jax.jit(jax.vmap(mjx.step, in_axes=(None, 0)))
 
     dx = step(mx, dx)                      # 编译 + 预热（不计时）
@@ -103,7 +127,8 @@ def bench(cone, impratio, condim, roll, n_envs, n_steps, settle):
     q = np.asarray(dx.qpos[0])
     q_ref = np.asarray(mjm.key_qpos[0])
     dq_max = float(np.abs(q[7:] - q_ref[7:]).max())
-    return ms, rate, bz, dq_max
+    ncon = int(np.asarray(dx.ncon[0])) if hasattr(dx, "ncon") else -1
+    return ms, rate, bz, dq_max, ncon, mx.nconmax, mx.njmax
 
 
 def main():
@@ -120,23 +145,25 @@ def main():
     print(f"MJX {jax.__version__} | devices={jax.devices()} | envs={args.envs} "
           f"| 计时 {args.steps} 子步")
     print(f"{'变体':<10}{'ms/子步':>10}{'env·子步/s':>14}{'相对base':>10}"
-          f"{'base_z':>9}{'max|Δq|':>9}  说明")
-    print("-" * 108)
+          f"{'base_z':>9}{'max|Δq|':>9}{'ncon':>6}  说明")
+    print("-" * 118)
 
     base_rate = None
+    ncm = njm = -1
     for name in names:
-        cone, imp, cd, roll, desc = VARIANTS[name]
+        cfg = VARIANTS[name]
         try:
-            ms, rate, bz, dq = bench(cone, imp, cd, roll, args.envs,
-                                     args.steps, args.settle)
+            ms, rate, bz, dq, ncon, ncm, njm = bench(
+                cfg, args.envs, args.steps, args.settle)
             if base_rate is None:
                 base_rate = rate
             sp = rate / base_rate
             print(f"{name:<10}{ms:>10.2f}{rate:>14.0f}{sp:>9.2f}x"
-                  f"{bz:>9.4f}{dq:>9.4f}  {desc}")
+                  f"{bz:>9.4f}{dq:>9.4f}{ncon:>6}  {cfg['desc']}")
         except Exception as e:
             print(f"{name:<10}{'FAIL':>10}  {type(e).__name__}: {e}")
-    print("-" * 108)
+    print("-" * 118)
+    print(f"模型静态容量：nconmax={ncm} njmax={njm}（越大求解器每次迭代越贵）")
     print("判据：① 相对 base 的加速比 ≥3x 才值得考虑换；")
     print("      ② base_z 与 base 相差 <0.005m 且 max|Δq| <0.05rad 才算精度可接受；")
     print("      ③ 两个条件同时满足 → 直接改 XML 并重跑训练对比。")
