@@ -101,6 +101,31 @@ def make_batch(mjm, mx, n_envs):
                                    (n_envs,) + jnp.asarray(x).shape), dx)
 
 
+def _diag(dx, mx):
+    """诊断量（ncon / 容量），任何异常都只能返回 -1，绝不能影响测量结果"""
+    ncon = -1
+    for getter in (lambda: dx.ncon, lambda: getattr(dx, "_impl").ncon):
+        try:
+            a = np.asarray(getter()).reshape(-1)
+            if a.size:
+                ncon = int(a[0])
+                break
+        except Exception:
+            continue
+    ncm = njm = -1
+    for name in ("nconmax", "njmax"):
+        try:
+            v = getattr(mx, name)
+            if v is not None:
+                if name == "nconmax":
+                    ncm = int(v)
+                else:
+                    njm = int(v)
+        except Exception:
+            pass
+    return ncon, ncm, njm
+
+
 def bench(cfg, n_envs, n_steps, settle):
     mjm, _ = load_model(cfg)
     mx = mjx.put_model(mjm)
@@ -127,8 +152,8 @@ def bench(cfg, n_envs, n_steps, settle):
     q = np.asarray(dx.qpos[0])
     q_ref = np.asarray(mjm.key_qpos[0])
     dq_max = float(np.abs(q[7:] - q_ref[7:]).max())
-    ncon = int(np.asarray(dx.ncon[0])) if hasattr(dx, "ncon") else -1
-    return ms, rate, bz, dq_max, ncon, mx.nconmax, mx.njmax
+    ncon, ncm, njm = _diag(dx, mx)
+    return ms, rate, bz, dq_max, ncon, ncm, njm
 
 
 def main():
@@ -152,6 +177,7 @@ def main():
     ncm = njm = -1
     for name in names:
         cfg = VARIANTS[name]
+        print(f"  [{name}] 编译中（新模型 → 新 jit，约 1~2 分钟）…", flush=True)
         try:
             ms, rate, bz, dq, ncon, ncm, njm = bench(
                 cfg, args.envs, args.steps, args.settle)
