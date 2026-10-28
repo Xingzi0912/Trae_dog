@@ -354,7 +354,8 @@ def run_interactive(env, actor_apply, params, obs_rms_dict, seed: int = 0):
 
 def run_offscreen(env, actor_apply, params, obs_rms_dict,
                   n_steps: int, out_path: Path, seed: int = 0,
-                  cmd_schedule=None, stochastic: bool = False):
+                  cmd_schedule=None, stochastic: bool = False,
+                  zero_action: bool = False):
     """离屏渲染，matplotlib 存 mp4 或 gif"""
     import matplotlib
     matplotlib.use("Agg")
@@ -429,7 +430,7 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         rng, k_act = jax.random.split(rng)
         act, std = actor_apply(params["actor"], obs_n, k_act)
         action = jnp.clip(act, -1.0, 1.0)
-        if args.zero_action:
+        if zero_action:
             # 纯基准步态（残差置零）：与实机 --action-scale 0 直接对照
             action = jnp.zeros_like(action)
 
@@ -583,7 +584,8 @@ def main():
         print("模式: 离屏视频（--video）")
         run_offscreen(env, actor_apply, params, obs_rms_dict,
                       args.steps, out_path, args.seed,
-                      cmd_schedule=cmd_schedule, stochastic=args.stochastic)
+                      cmd_schedule=cmd_schedule, stochastic=args.stochastic,
+                      zero_action=args.zero_action)
 
 
 if __name__ == "__main__":
