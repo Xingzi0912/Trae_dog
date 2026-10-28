@@ -429,6 +429,9 @@ def run_offscreen(env, actor_apply, params, obs_rms_dict,
         rng, k_act = jax.random.split(rng)
         act, std = actor_apply(params["actor"], obs_n, k_act)
         action = jnp.clip(act, -1.0, 1.0)
+        if args.zero_action:
+            # 纯基准步态（残差置零）：与实机 --action-scale 0 直接对照
+            action = jnp.zeros_like(action)
 
         if step % 100 == 0 or step == 1:
             print(f"  step {step}: |mu|mean={float(jnp.abs(act).mean()):.3f} "
@@ -508,7 +511,25 @@ def main():
     ap.add_argument("--gait_mode", type=str, default="sine",
                     choices=["sine", "ik"],
                     help="基准步态实现，必须与训练该 checkpoint 时一致")
+    ap.add_argument("--zero-action", action="store_true", default=False,
+                    help="残差强制置零，只渲染基准步态（与实机 --action-scale 0 对照）")
+    ap.add_argument("--ik-lift", type=float, default=None)
+    ap.add_argument("--ik-duty", type=float, default=None)
+    ap.add_argument("--ik-gain", type=float, default=None)
+    ap.add_argument("--ik-freq", type=float, default=None,
+                    help="固定 IK 步频（Hz），便于肉眼看足端轨迹")
     args = ap.parse_args()
+
+    # 步态参数必须在 env 构造（JIT trace）之前写入
+    import envs.gait as _G
+    if args.ik_lift is not None:
+        _G.IK_LIFT = args.ik_lift
+    if args.ik_duty is not None:
+        _G.IK_DUTY = args.ik_duty
+    if args.ik_gain is not None:
+        _G.IK_STRIDE_GAIN = args.ik_gain
+    if args.ik_freq is not None:
+        _G.FREQ_MIN = _G.FREQ_MAX = args.ik_freq
 
     if not args.interactive and not args.video:
         args.video = True  # 默认视频模式
