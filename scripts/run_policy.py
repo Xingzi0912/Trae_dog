@@ -1040,6 +1040,7 @@ class Runner:
 
 
 def main():
+    global KP_FINAL, KD_FINAL
     ap = argparse.ArgumentParser(description="学生策略上实机（键盘/手柄触发）")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--dry-run", action="store_true", help="kp=0 腿软，只验证数据链路")
@@ -1050,6 +1051,13 @@ def main():
                     help="基准步态类型，**必须与训练时 --gait_mode 一致**。"
                          "2026-10-28 起训练默认 ik（正弦步态的推进方向由触地时序"
                          "涌现，实机会反向）；旧 checkpoint 用 sine")
+    ap.add_argument("--kp", type=float, default=None,
+                    help="覆盖站立/运行时的 kp（默认 %.0f）。实机 2026-10-28 实测："
+                         "后腿小腿扛 29 N·m 时，kp=150 的稳态误差 = 29/150 = 0.19 rad"
+                         "(11°)，后腿被压塌 3~4cm、重心后移、整机往后倒。"
+                         "调 220~300 可减小下垂，但策略是按 kp=150 训的（DR 120~180），"
+                         "改动后需重训对齐" % KP_FINAL)
+    ap.add_argument("--kd", type=float, default=None, help="覆盖 kd（默认 %.1f）" % KD_FINAL)
     ap.add_argument("--level-imu", action="store_true", default=True,
                     help="用站立姿态把 IMU 的恒定倾斜旋掉（默认开）。实机实测站姿 "
                          "g_b=[-0.08,+0.05,-1]，而仿真= [0,0,-1]；这 5° 偏置会让"
@@ -1097,6 +1105,11 @@ def main():
     args = ap.parse_args()
     if not Path(args.npz).exists():
         sys.exit(f"找不到部署包 {args.npz}")
+    # kp/kd 覆盖（必须在 Runner 读 KP_FINAL 之前）
+    if args.kp is not None:
+        KP_FINAL = float(args.kp)
+    if args.kd is not None:
+        KD_FINAL = float(args.kd)
     # 运行时覆盖 IK 步态参数（必须在任何 gait_for 调用之前）
     set_ik_params(lift=args.ik_lift, duty=args.ik_duty, gain=args.ik_gain,
                   freq=args.ik_freq)
