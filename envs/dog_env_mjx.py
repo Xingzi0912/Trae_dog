@@ -140,6 +140,12 @@ class EnvConfig:
     action_delay_range: tuple = (0, 2)     # 策略步
     obs_noise_scale: float = 1.0           # 0 = 关观测噪声
     gravity_noise: float = 0.03            # projected gravity 分量噪声(0.02~0.05)
+    # 编码器零位偏差（per-episode 常量，只进学生观测，不进特权观测）。
+    # 参考 My_unitree_go2_gym 的 randomize_motor_zero_offset=[-0.035,0.035]；
+    # 我们的实机站姿是手工摆的，零位误差正是这个量级。
+    motor_zero_range: tuple = (-0.035, 0.035)   # rad
+    # 观测里是否带步态相位 sin/cos（末 2 维）。参考 go2_trot 直接喂相位。
+    obs_phase: bool = True
 
 
 class DRParams(NamedTuple):
@@ -148,6 +154,7 @@ class DRParams(NamedTuple):
     mass_scale: jax.Array  # base_link 质量乘子
     kp_scale: jax.Array
     kv_scale: jax.Array
+    motor_zero: jax.Array  # (12,) 编码器零位偏差 rad（只进学生观测）
 
 
 class EnvState(NamedTuple):
@@ -294,8 +301,9 @@ class DogEnvMJX:
         cfg = self.cfg
         if not cfg.dr_enabled:
             return DRParams(fric=self._nom_foot_fric, mass_scale=jnp.float32(1.0),
-                            kp_scale=jnp.float32(1.0), kv_scale=jnp.float32(1.0))
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+                            kp_scale=jnp.float32(1.0), kv_scale=jnp.float32(1.0),
+                            motor_zero=jnp.zeros(12, jnp.float32))
+        k1, k2, k3, k4, k5 = jax.random.split(key, 5)
         return DRParams(
             fric=jax.random.uniform(k1, (), minval=cfg.friction_range[0],
                                     maxval=cfg.friction_range[1]),
@@ -305,6 +313,9 @@ class DogEnvMJX:
                                         maxval=cfg.kp_scale_range[1]),
             kv_scale=jax.random.uniform(k4, (), minval=cfg.kv_scale_range[0],
                                         maxval=cfg.kv_scale_range[1]),
+            motor_zero=jax.random.uniform(k5, (12,),
+                                          minval=cfg.motor_zero_range[0],
+                                          maxval=cfg.motor_zero_range[1]),
         )
 
     def sample_model_dr(self, key: jax.Array, k: int = None) -> DRParams:
@@ -483,7 +494,8 @@ class DogEnvMJX:
             dr=dr,
             rng=k_noise,
         )
-        obs = self._get_obs(dx, state.last_action, state.command, k_noise)
+        obs = self._get_obs(dx, state.last_action, state.command, k_noise,
+                            phase=state.gait_phase, dr=state.dr)
         return state, obs
 
     def _apply_dr(self, mx: mjx.Model, dr: DRParams) -> mjx.Model:
@@ -500,24 +512,45 @@ class DogEnvMJX:
         return mx.replace(geom_friction=gf, body_mass=bm,
                           actuator_gainprm=ag, actuator_biasprm=ab)
 
+    def _phase_block(self, phase: jax.Array) -> jax.Array:
+        """obs[46:58]：步态相位 sin/cos（前 2 维）+ 10 维保留 0
+
+        2026-10-28 替换原来的 q_default 常量块（常量对策略零信息）。
+        关相位时退回 q_default，便于与旧 checkpoint 对照。
+        """
+        if not self.cfg.obs_phase:
+            return self._q_default
+        ph = 2.0 * jnp.pi * (phase if phase is not None else jnp.zeros(()))
+        return jnp.concatenate([jnp.stack([jnp.sin(ph), jnp.cos(ph)]),
+                                jnp.zeros(10, jnp.float32)])
+
     def _get_obs(self, dx: mjx.Data, last_action: jax.Array,
-                 command: jax.Array, noise_key) -> jax.Array:
+                 command: jax.Array, noise_key,
+                 phase: jax.Array = None, dr: "DRParams" = None) -> jax.Array:
         cfg = self.cfg
         R = _quat_to_mat(dx.qpos[3:7])
         g_b = -R[2, :]                     # Rᵀ·[0,0,-1]
         lin_b = R.T @ dx.qvel[0:3]         # 机身系线速度
         ang_b = dx.qvel[3:6]               # 机身系角速度（freejoint 本就机身系）
-        obs = jnp.concatenate([
+        q_obs = dx.qpos[7:]
+        if dr is not None:
+            # 编码器零位偏差：只污染学生（=实机）的关节读数，特权观测仍用真值
+            q_obs = q_obs + dr.motor_zero
+        parts = [
             dx.qpos[2:3],                  #  0   base_z
             g_b,                           #  1:4
             lin_b,                         #  4:7
             ang_b,                         #  7:10
-            dx.qpos[7:],                   # 10:22
+            q_obs,                         # 10:22（含零位偏差）
             dx.qvel[6:],                   # 22:34
             last_action,                   # 34:46
-            self._q_default,               # 46:58
+            # 46:58 原是 q_default（常量，零信息）。2026-10-28 换成步态相位：
+            # 参考 go2_trot 直接把 sin/cos 相位喂给策略，而不是让它从关节角
+            # 自己推断（实机关节角有摩擦滞后 + 零位误差）。
+            self._phase_block(phase),      # 46:58
             command,                       # 58:61
-        ])
+        ]
+        obs = jnp.concatenate(parts)
         if cfg.dr_enabled and cfg.obs_noise_scale > 0:
             obs = obs + self._obs_noise_std * cfg.obs_noise_scale \
                         * jax.random.normal(noise_key, (self.OBS_DIM,))
@@ -643,7 +676,8 @@ class DogEnvMJX:
             gait_phase=gait_phase,
             dr=state.dr, rng=rng,
         )
-        obs = self._get_obs(dx, action, command, k_noise)
+        obs = self._get_obs(dx, action, command, k_noise,
+                            phase=gait_phase, dr=state.dr)
         priv = self._get_privileged_obs(dx, state.dr)
         info = {
             "base_z": base_z,

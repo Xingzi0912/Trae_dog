@@ -583,8 +583,13 @@ class Runner:
         return mask
 
     def build_obs(self, q_sim, dq_sim, gyro, g_b, lin_b, cmd):
+        # obs[46:58] = 步态相位 sin/cos（前 2 维）+ 10 个 0。
+        # 2026-10-28 起训练把原来的 q_default 常量块换成了相位（常量零信息），
+        # 参考 go2_trot 的做法：把相位直接喂给策略，而不是让它从关节角自己推断。
+        ph = 2.0 * math.pi * self.gait_phase
+        phase_block = np.concatenate([[math.sin(ph), math.cos(ph)], np.zeros(10)])
         return np.concatenate([[self.base_z], g_b, lin_b, gyro, q_sim, dq_sim,
-                               self.last_action, Q_DEFAULT_NEW, cmd])
+                               self.last_action, phase_block, cmd])
 
     # ---- 设备自检 ----
     def preflight_pad(self):
