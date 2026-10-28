@@ -127,22 +127,37 @@ def _ik_planar(x, z):
     return q1, q2
 
 
-def gait_ik(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
-    """IK 驱动 trot：直接编码全向步进，返回 (…,12) 相对 q_default 的增量"""
+def gait_freq(command: jax.Array) -> jax.Array:
+    """当前指令对应的基准步频（Hz）
+
+    v26（2026-10-28 实机）：相位必须由调用方**累加**，不能由步数反算。
+    旧写法 phase = steps·DT·freq(cmd) 里 freq 依赖指令，指令一变相位就被重算：
+    实测 steps=250、vx 0→0.13 时相位跳了 1.1 个周期 → 四条腿目标瞬移一整周期
+    → 实机 PD 猛顶、身体被弹起 3.3cm（"短摁手柄就抖"的直接原因）。
+    累加式 phase += DT·freq 在指令变化时只改变推进速度，相位本身连续。
+    """
+    vx = command[..., 0]
+    vy = command[..., 1]
+    yaw = command[..., 2]
+    speed = jnp.sqrt(vx ** 2 + vy ** 2) + 0.25 * jnp.abs(yaw)
+    return FREQ_MIN + (FREQ_MAX - FREQ_MIN) * jnp.clip(speed / 1.2, 0.0, 1.0)
+
+
+def gait_ik_phase(phase: jax.Array, command: jax.Array) -> jax.Array:
+    """IK 驱动 trot：phase ∈ [0,1) 为**周期相位**（由调用方累加）
+
+    返回 (…,12) 相对 q_default 的增量。
+    """
     vx = command[..., 0]
     vy = command[..., 1]
     yaw = command[..., 2]
     speed = jnp.sqrt(vx ** 2 + vy ** 2) + 0.25 * jnp.abs(yaw)
 
-    # 步频随速度提高；零指令时抬脚高度与步幅都门控到 0（纯站立）
-    freq = FREQ_MIN + (FREQ_MAX - FREQ_MIN) * jnp.clip(speed / 1.2, 0.0, 1.0)
-    cyc = 1.0 / freq
     amp = jnp.clip(speed / 0.3, 0.0, 1.0)
-
-    phase = (episode_steps * DT / cyc) % 1.0               # (N,) 归一化相位
-    ph = (phase[..., None] + LEG_PHASE) % 1.0              # (N,4)
+    ph = (phase[..., None] + LEG_PHASE) % 1.0     # 标量 → (4,)；批次 → (N,4)
 
     # 每只脚的期望机体速度（含 yaw 切向分量）；支撑相脚相对机身反向移动
+    cyc = 1.0 / gait_freq(command)
     T_st = IK_DUTY * cyc
     vx_i = vx[..., None] - yaw[..., None] * LEG_Y
     vy_i = vy[..., None] + yaw[..., None] * LEG_X
@@ -179,6 +194,16 @@ def gait_ik(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     q = jnp.stack([q_hip, q_thigh, q_calf], axis=-1).reshape(
         command.shape[:-1] + (12,))
     return q - Q_DEFAULT
+
+
+def gait_ik(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
+    """向后兼容包装：由步数反算相位（**指令恒定**时才与累加版等价）
+
+    仅供 probe_gait.py 这类恒定指令的离线探针使用；训练/部署都走
+    gait_ik_phase + 调用方累加相位。
+    """
+    phase = (episode_steps * DT * gait_freq(command)) % 1.0
+    return gait_ik_phase(phase, command)
 
 
 def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:

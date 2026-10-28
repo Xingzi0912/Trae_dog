@@ -170,15 +170,25 @@ def _ik_planar_np(x, z):
     return q1, q2
 
 
-def gait_ik_np(step: int, cmd) -> np.ndarray:
-    """与 envs/gait.py::gait_ik 对齐的 numpy 实现（对拍偏差 <1e-6 rad）"""
+def gait_freq_np(cmd) -> float:
+    """当前指令对应的基准步频（Hz），与 envs/gait.py::gait_freq 一致"""
     vx, vy, yaw = float(cmd[0]), float(cmd[1]), float(cmd[2])
     speed = math.sqrt(vx * vx + vy * vy) + 0.25 * abs(yaw)
-    freq = FREQ_MIN + (FREQ_MAX - FREQ_MIN) * min(max(speed / 1.2, 0.0), 1.0)
-    cyc = 1.0 / freq
+    return FREQ_MIN + (FREQ_MAX - FREQ_MIN) * min(max(speed / 1.2, 0.0), 1.0)
+
+
+def gait_ik_phase_np(phase: float, cmd) -> np.ndarray:
+    """与 envs/gait.py::gait_ik_phase 对齐；phase ∈ [0,1) 由调用方累加
+
+    2026-10-28：**不要**再由步数反算相位。旧写法 phase =步数·DT·freq(指令)
+    在指令变化时会被重算（跳变幅度 = 步数·DT·Δfreq，最大半周期），
+    实机表现为"短按手柄就剧烈抖动、身体被弹起 3cm"。
+    """
+    vx, vy, yaw = float(cmd[0]), float(cmd[1]), float(cmd[2])
+    speed = math.sqrt(vx * vx + vy * vy) + 0.25 * abs(yaw)
+    cyc = 1.0 / gait_freq_np(cmd)
     amp = min(max(speed / 0.3, 0.0), 1.0)
 
-    phase = (step * DT / cyc) % 1.0
     ph = (phase + LEG_PHASE) % 1.0
 
     T_st = IK_DUTY * cyc
@@ -209,8 +219,16 @@ def gait_ik_np(step: int, cmd) -> np.ndarray:
     return q - Q_DEFAULT_NEW
 
 
-def gait_for(gait_type: str, step: int, cmd) -> np.ndarray:
-    return gait_ik_np(step, cmd) if gait_type == "ik" else gait_np(step, cmd)
+def gait_ik_np(step: int, cmd) -> np.ndarray:
+    """向后兼容包装（由步数反算相位）。**仅用于恒定指令的离线对拍**；
+    实机循环必须用 gait_ik_phase_np + 累加相位。"""
+    phase = (step * DT * gait_freq_np(cmd)) % 1.0
+    return gait_ik_phase_np(phase, cmd)
+
+
+def gait_for(gait_type: str, step: int, cmd, phase: float = 0.0) -> np.ndarray:
+    return (gait_ik_phase_np(phase, cmd) if gait_type == "ik"
+            else gait_np(step, cmd))
 
 
 # ---------------------------------------------------------------- 策略
@@ -700,6 +718,7 @@ class Runner:
                         phase, t_phase = "RUN", 0.0
                         run_t0 = time.time()
                         self.step = 0
+                        self.gait_phase = 0.0
                         self.vx_eff = 0.0
                         self.walk_on = False
                         self.last_walking = False
@@ -802,7 +821,11 @@ class Runner:
                         a = np.clip(self.policy.act(obs), -1.0, 1.0)
                         a = self.last_action + np.clip(a - self.last_action, -0.15, 0.15)
                         self.last_action = a.copy()
-                        g = gait_for(args.gait_type, self.step, cmd)
+                        g = gait_for(args.gait_type, self.step, cmd, self.gait_phase)
+                        # 相位累加：指令变化只改变推进速度，相位本身连续
+                        # （旧写法由步数反算，指令一变相位就跳，实机表现为剧烈抖动）
+                        self.gait_phase = (self.gait_phase
+                                           + DT * gait_freq_np(cmd)) % 1.0
                         q_des_sim = np.clip(Q_DEFAULT_NEW + g
                                             + 0.2 * args.action_scale * a,
                                             JNT_LO, JNT_HI)

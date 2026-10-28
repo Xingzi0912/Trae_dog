@@ -69,7 +69,9 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from envs.gait import gait as gait_fn, gait_ik as gait_ik_fn
+from envs.gait import (gait as gait_fn, gait_ik as gait_ik_fn,
+                       gait_ik_phase as gait_ik_phase_fn,
+                       gait_freq as gait_freq_fn)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +159,7 @@ class EnvState(NamedTuple):
     delay: jax.Array         # int32 ∈ [0,2]
     resample_in: jax.Array   # int32 距下次指令重采样剩余策略步
     episode_steps: jax.Array
+    gait_phase: jax.Array    # 标量 ∈[0,1) 基准步态周期相位（累加，指令变化不跳变）
     dr: DRParams
     rng: jax.Array
 
@@ -427,7 +430,7 @@ class DogEnvMJX:
 
     def _reset_one(self, key, dr: DRParams):
         cfg = self.cfg
-        k_init, k_cmd, k_delay, k_int, k_noise = jax.random.split(key, 5)
+        k_init, k_cmd, k_delay, k_int, k_noise, k_phase = jax.random.split(key, 6)
 
         # 模型级 DR 由调用方在 vmap 外层采样后广播进来（build_model 用它注入共享
         # 模型）；state.dr 只保留这份标量供特权观测使用，不再参与模型构造
@@ -475,6 +478,8 @@ class DogEnvMJX:
             delay=delay,
             resample_in=jax.random.randint(k_int, (), lo, hi + 1),
             episode_steps=jnp.zeros((), jnp.int32),
+            # 相位随机初始化：让策略见过任意起始相位，避免只适应"从 0 开始"
+            gait_phase=jax.random.uniform(k_phase, (), minval=0.0, maxval=1.0),
             dr=dr,
             rng=k_noise,
         )
@@ -563,7 +568,7 @@ class DogEnvMJX:
         action = jnp.clip(action, -1.0, 1.0)
         if cfg.use_residual:
             # 残差模式：q_des = q_default + 基准步态 + action × residual_scale
-            base_gait = (gait_ik_fn(state.episode_steps, state.command)
+            base_gait = (gait_ik_phase_fn(state.gait_phase, state.command)
                          if cfg.gait_mode == "ik"
                          else gait_fn(state.episode_steps, state.command))
             q_des = self._q_default + base_gait + action * cfg.residual_scale
@@ -616,6 +621,10 @@ class DogEnvMJX:
         reward = r_track + r_yaw + r_upright + r_energy + r_jerk + r_vz + r_rp
 
         steps = state.episode_steps + 1
+        # 基准步态相位累加（指令变化只改推进速度，相位本身连续）
+        # 策略步长 = XML timestep × frame_skip = 0.002 × 10 = 0.02 s
+        gait_phase = (state.gait_phase
+                      + cfg.frame_skip * 0.002 * gait_freq_fn(state.command)) % 1.0
         terminated = base_z < cfg.z_terminate
         truncated = steps >= cfg.max_steps
 
@@ -631,6 +640,7 @@ class DogEnvMJX:
         new_state = EnvState(
             dx=dx, last_action=action, command=command, delay_buf=buf,
             delay=state.delay, resample_in=resample_in, episode_steps=steps,
+            gait_phase=gait_phase,
             dr=state.dr, rng=rng,
         )
         obs = self._get_obs(dx, action, command, k_noise)
