@@ -144,7 +144,9 @@ def test_consistency():
     print(f"  q   (10:22): max={np.degrees(d[:, 10:22].max()):.4f}°")
     print(f"  dq  (22:34): max={d[:, 22:34].max():.6f} rad/s")
     print(f"  last_act   : max={d[:, 34:46].max():.6f}")
-    print(f"  q_default  : max={d[:, 46:58].max():.6f}")
+    # obs[46:58] 2026-10-28 起在 env 里是步态相位块（相位来自 env 状态，CPU 参考
+    # 侧不含），不参与一致性比较；物理量（z/姿态/速度/关节/指令）覆盖 0:46+58:61。
+    print(f"  [46:58]    : 跳过（env 侧为步态相位 sin/cos，非物理量）")
     print(f"  cmd        : max={d[:, 58:61].max():.6f}")
 
     jmax = np.degrees(d[:, 10:22].max())

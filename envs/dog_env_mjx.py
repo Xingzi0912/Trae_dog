@@ -144,6 +144,10 @@ class EnvConfig:
     # 参考 My_unitree_go2_gym 的 randomize_motor_zero_offset=[-0.035,0.035]；
     # 我们的实机站姿是手工摆的，零位误差正是这个量级。
     motor_zero_range: tuple = (-0.035, 0.035)   # rad
+    # 观测延迟（策略步）：实机有 CAN 往返 + 串口 + 组帧延迟，仿真原为 0。
+    # 参考 go2_trot 的 range_obs_motor_latency / range_obs_imu_latency = [1,3]。
+    # 50Hz 下 1~3 步 = 20~60 ms。设 (0,0) 可关闭。
+    obs_delay_range: tuple = (1, 3)
     # 观测里是否带步态相位 sin/cos（末 2 维）。参考 go2_trot 直接喂相位。
     obs_phase: bool = True
 
@@ -167,6 +171,8 @@ class EnvState(NamedTuple):
     resample_in: jax.Array   # int32 距下次指令重采样剩余策略步
     episode_steps: jax.Array
     gait_phase: jax.Array    # 标量 ∈[0,1) 基准步态周期相位（累加，指令变化不跳变）
+    obs_buf: jax.Array       # (4,61) 历史观测，index 0 = 最新（用于观测延迟 DR）
+    obs_delay: jax.Array     # int32 ∈[0,3] 策略实际看到的延迟步数
     dr: DRParams
     rng: jax.Array
 
@@ -215,6 +221,8 @@ class DogEnvMJX:
     Q_DEFAULT = np.array([-0.0134, 0.8611, -1.7340, 0.0160, 0.8531, -1.7100,
                           0.0088, 0.8801, -1.7210, -0.0133, 0.9111, -1.6946])
     OBS_DIM = 61
+    # 观测延迟缓冲长度 = max(obs_delay_range) + 1
+    OBS_BUF = 4
     ACT_DIM = 12
 
     def __init__(self, n_envs: int, config: EnvConfig = None,
@@ -441,7 +449,8 @@ class DogEnvMJX:
 
     def _reset_one(self, key, dr: DRParams):
         cfg = self.cfg
-        k_init, k_cmd, k_delay, k_int, k_noise, k_phase = jax.random.split(key, 6)
+        k_init, k_cmd, k_delay, k_int, k_noise, k_phase, k_dly = \
+            jax.random.split(key, 7)
 
         # 模型级 DR 由调用方在 vmap 外层采样后广播进来（build_model 用它注入共享
         # 模型）；state.dr 只保留这份标量供特权观测使用，不再参与模型构造
@@ -493,10 +502,17 @@ class DogEnvMJX:
             gait_phase=jax.random.uniform(k_phase, (), minval=0.0, maxval=1.0),
             dr=dr,
             rng=k_noise,
+            # 观测延迟缓冲：初始填同一帧（延迟几帧都拿到同一初值，不会突变）
+            obs_buf=jnp.zeros((self.OBS_BUF, self.OBS_DIM), jnp.float32),
+            obs_delay=jax.random.randint(k_dly, (), cfg.obs_delay_range[0],
+                                          cfg.obs_delay_range[1] + 1),
         )
         obs = self._get_obs(dx, state.last_action, state.command, k_noise,
                             phase=state.gait_phase, dr=state.dr)
-        return state, obs
+        # 初值填满缓冲，保证第一帧读到的就是当前观测
+        obs_buf = jnp.repeat(obs[None, :], self.OBS_BUF, axis=0)
+        state = state._replace(obs_buf=obs_buf)
+        return state, obs_buf[state.obs_delay]
 
     def _apply_dr(self, mx: mjx.Model, dr: DRParams) -> mjx.Model:
         """把**标量**模型级 DR 注入共享模型（只在 vmap 外层调用，见 build_model）
@@ -670,14 +686,19 @@ class DogEnvMJX:
         resample_in = jnp.where(do, jax.random.randint(k_int, (), lo, hi + 1),
                                 resample_in)
 
+        # 观测延迟：先把瞬时观测压进缓冲，再按本 episode 的延迟取出一帧
+        obs_now = self._get_obs(dx, action, command, k_noise,
+                                phase=gait_phase, dr=state.dr)
+        obs_buf = jnp.roll(state.obs_buf, 1, axis=0).at[0].set(obs_now)
+        obs = obs_buf[state.obs_delay]
+
         new_state = EnvState(
             dx=dx, last_action=action, command=command, delay_buf=buf,
             delay=state.delay, resample_in=resample_in, episode_steps=steps,
             gait_phase=gait_phase,
+            obs_buf=obs_buf, obs_delay=state.obs_delay,
             dr=state.dr, rng=rng,
         )
-        obs = self._get_obs(dx, action, command, k_noise,
-                            phase=gait_phase, dr=state.dr)
         priv = self._get_privileged_obs(dx, state.dr)
         info = {
             "base_z": base_z,
