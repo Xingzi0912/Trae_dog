@@ -855,7 +855,7 @@ clip/kl 是否回落、σ 是否健康分化。
 #### 四、实机硬性约束（实测）
 
 - **力矩天花板**：静站后腿小腿 14~15 N·m；迈步时 17~26；全力残差时冲到 45。
-- **CAN/UBS 掉线**：两次 `libusb_transfer_cancelled` 都紧跟在 `|tau|>34` 之后，
+- **CAN/USB 掉线**：两次 `libusb_transfer_cancelled` 都紧跟在 `|tau|>34` 之后，
   判断为大电流导致电压跌落/EMI 打断 USB 链路（软件无法恢复，电机保持使能）。
   已加 `--tau-abort`（默认 30 N·m，持续 0.2s 主动停车）作为保护。
 - 标称峰值 40 N·m，但用户供电电压偏低，实际可用上限低得多（实测 29 附近
@@ -888,4 +888,71 @@ sudo python3 scripts/run_policy.py --go --vx 0.3 --action-scale 0.5 \
 4. **重标站姿**：让后腿离屈膝失稳区更远（当前零指令姿势已在边界附近），
    并校准实机 CoM（实机后腿负载比仿真高 50%+）。
 5. 硬件：USB 线加磁环 / 独立供电 HUB；若持续需要 >25 N·m 再考虑换电源。
+
+### 2026-10-28 — 训练吞吐定位：机身碰撞体是元凶（3.24x）
+
+**背景**：用户独占服务器，目标"先缩减训练时间，再修正步态"。实测 rollout 占
+99%（50~65 s/update，前向 + PPO 更新合计仅 1 s），换算约 9,800 env·物理子步/s，
+对 4090 而言低约两个数量级。
+
+**实测数据**（`scripts/bench_contact_options.py`，2048 env，MJX，全为测稳后取值）
+
+| 配置 | ms/子步 | env·子步/s | ncon | 相对 |
+| --- | --- | --- | --- | --- |
+| 原始 | 246.36 | 8,313 | **300** | 1.00x |
+| 只关机身↔机身（body contype=2/caff=1，脚不变） | 167.44 | 12,232 | 110 | 1.47x |
+| 机身+脚都 contype=2/caff=1（只与地面碰） | 99.03 | 20,680 | 48 | 2.49x |
+| **机身全关 contype=0，只留四脚** | **76.07** | **26,923** | **10** | **3.24x** |
+
+**根因**：`<default class="collision"><geom group="3"/>` 当初没写 contype/conaffinity，
+17 个机身碰撞体之间、以及脚与小腿碰撞体之间产生约 **290 个接触**（相邻连杆的
+碰撞盒在关节处天然重叠）。判据：**base_z 与 max|Δq| 在改前改后完全一致**
+（0.3145 / 0.0612），说明这些接触对动力学零贡献，纯烧算力。
+
+**最终配置**（`dog_mjx.xml` 与 `dog_positional.xml` 同步，各一行）
+
+```xml
+<default class="collision">
+  <geom group="3" contype="0" conaffinity="0"/>        <!-- 机身全部关闭 -->
+  <default class="foot">
+    <geom size="0.022" pos="-0.002 0 -0.213" priority="1" condim="6"
+          friction="0.9 0.02 0.01" contype="2" conaffinity="1"/>   <!-- 只留脚 -->
+  </default>
+</default>
+```
+
+位掩码验算：脚↔地面 `(2&1)=0 || (1&1)=1` → 碰；脚↔脚、脚↔机身、机身↔机身
+全为 0 → 不碰。活跃 geom = 4 只脚（+地面），可碰对 = 4。
+
+**为什么安全**：环境逻辑从不使用物理接触——
+`contact[4]` 是几何法 `foot_z < 0.05`（`dog_env_mjx.py:540`），
+终止条件是 `base_z < 0.25`（`dog_env_mjx.py:619`），奖励无接触项。
+代价仅剩"摔倒时机身穿地面"，而 `base_z<0.25` 会在穿地之前终止该 episode。
+
+**走过的弯路（重要教训）**
+
+1. 先怀疑求解器配置：`cone=pyramidal` 1.42x、`condim=3` 1.49x、
+   最激进组合（金字塔+imp1+condim3+无滚动）1.70x —— **最多 1.7 倍**，
+   而且金字塔锥让站立高度掉 1.2 cm（0.3154 vs keyframe 0.327），精度不可接受。
+2. `--dr_pools 1` vs `256` 实测 65 s vs 71 s，**DR 池化只占 9%**，不是瓶颈。
+3. **教训：先数接触（ncon），再调求解器。** ncon 是最便宜、最有判别力的诊断量；
+   一个默认类里漏写的两个属性（contype/conaffinity）代价是 3.24 倍吞吐。
+
+**工具**：`scripts/bench_contact_options.py`（新增）
+
+- 直接改 `MjModel` 字段（不碰 XML 文件），一次扫 9 个变体
+- 输出：ms/子步、env·子步/s、相对 base、1 秒后 base_z、max|Δq|、ncon
+- 判据：加速 ≥3x **且** base_z 差 <5 mm、max|Δq| <0.05 rad
+- 坑：本模型（condim=1 机身 + condim=6 脚）必须走
+  `mj_resetDataKeyframe + mj_forward + mjx.put_data`，
+  用 `mjx.make_data` 会抛 `NotImplementedError: condim=1 with ConeType.ELLIPTIC`
+
+**效果**：8M 步训练 3 小时 → 约 55 分钟。
+
+**下一步**（回到 10-24 节列的步态三改，按优先级）
+1. 低速步态幅值抬到 ≥6°（vx=0.2 只有 4°，实机迈不开步）
+2. 摩擦 DR 下界 0.5 → 0.4（实机疑似打滑）
+3. 力矩限幅按实测 30 N·m 建模
+每轮 100 个 update（现在约 35 分钟）看 `alive` 与 `track`，一次只改一处。
+
 
