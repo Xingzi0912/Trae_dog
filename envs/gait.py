@@ -179,8 +179,13 @@ def gait(episode_steps: jax.Array, command: jax.Array) -> jax.Array:
     phase_b = phase + jnp.pi      # FR, RL
 
     # 幅值调制（v24：∝|vx| 速度门控，零指令幅值=0 纯站立）
-    amp_thigh = A_THIGH * jnp.clip(jnp.abs(vx) / 1.0, 0.0, 1.0)
-    amp_calf = A_CALF * jnp.clip(jnp.abs(vx) / 1.0, 0.0, 1.0)
+    # v26（2026-10-28 实机判决）：线性门控在低速段幅值太小——vx=0.2 只有
+    # 0.070 rad(4°)，实机实测摆腿抬脚不足、力矩涨到 26 N·m 也不产生位移。
+    # 改 sqrt 缩放：保持零指令=0、高速端不变（vx≥1.0 仍饱和到 0.35），
+    # 低速端翻倍：vx=0.1 → 6.3°，0.2 → 9.0°，0.3 → 11.0°，0.5 → 14.2°。
+    amp_scale = jnp.sqrt(jnp.clip(jnp.abs(vx) / 1.0, 0.0, 1.0))
+    amp_thigh = A_THIGH * amp_scale
+    amp_calf = A_CALF * amp_scale
     # vy 影响 hip 左右摆
     amp_hip = A_HIP * jnp.clip(jnp.abs(vy) / 0.5, 0.0, 1.0)
     # yaw 影响左右腿 hip 差（转向时内外侧步幅不同）

@@ -119,8 +119,10 @@ def gait_np(step: int, cmd) -> np.ndarray:
     freq = FREQ_MIN + (FREQ_MAX - FREQ_MIN) * t
     phase = (step * DT * freq * 2 * math.pi) % (2 * math.pi)
     pa, pb = phase, phase + math.pi
-    amp_thigh = A_THIGH * min(max(abs(vx) / 1.0, 0.0), 1.0)
-    amp_calf = A_CALF * min(max(abs(vx) / 1.0, 0.0), 1.0)
+    # v26（2026-10-28）：与 envs/gait.py 同步改 sqrt 缩放
+    amp_scale = math.sqrt(min(max(abs(vx) / 1.0, 0.0), 1.0))
+    amp_thigh = A_THIGH * amp_scale
+    amp_calf = A_CALF * amp_scale
     amp_hip = A_HIP * min(max(abs(vy) / 0.5, 0.0), 1.0)
     yaw_hip = A_HIP * 0.5 * min(max(yaw / 2.0, -1.0), 1.0)
     hs = 1.0 if vy >= 0 else -1.0
