@@ -248,6 +248,25 @@ def gait_for(gait_type: str, step: int, cmd, phase: float = 0.0) -> np.ndarray:
             else gait_np(step, cmd))
 
 
+def set_gait_pattern(name: str) -> None:
+    """切换 IK 步态相位模式（与 envs/gait.py::set_gait_pattern 逐项一致）
+
+    trot：对角 2 腿支撑，负载 2×，需要较硬关节。
+    walk：四拍侧序 3 腿支撑，负载 1.33×，**静态稳定** —— 腿软/重心偏后时用。
+    """
+    global LEG_PHASE, IK_DUTY, IK_LIFT, FREQ_MIN, FREQ_MAX, IK_STRIDE_GAIN
+    if name == "walk":
+        LEG_PHASE = np.array([0.25, 0.75, 0.0, 0.5])
+        IK_DUTY, IK_LIFT, IK_STRIDE_GAIN = 0.75, 0.04, 1.2
+        FREQ_MIN, FREQ_MAX = 1.2, 2.0
+    elif name == "trot":
+        LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])
+        IK_DUTY, IK_LIFT, IK_STRIDE_GAIN = 0.55, 0.06, 1.6
+        FREQ_MIN, FREQ_MAX = 2.0, 4.0
+    else:
+        raise ValueError(f"未知步态模式 {name}")
+
+
 def set_ik_params(lift=None, duty=None, gain=None, freq=None) -> None:
     """运行时覆盖 IK 步态参数（必须在第一次调用 gait_for 之前调）"""
     global IK_LIFT, IK_DUTY, IK_STRIDE_GAIN, FREQ_MIN, FREQ_MAX
@@ -1054,6 +1073,12 @@ def main():
                     help="基准步态类型，**必须与训练时 --gait_mode 一致**。"
                          "2026-10-28 起训练默认 ik（正弦步态的推进方向由触地时序"
                          "涌现，实机会反向）；旧 checkpoint 用 sine")
+    ap.add_argument("--gait-pattern", type=str, default="trot",
+                    choices=["trot", "walk"],
+                    help="IK 相位模式：trot=对角 2 腿支撑（默认）；"
+                         "walk=四拍侧序 3 腿支撑、静态稳定。"
+                         "**实机腿软/重心偏后时用 walk**（每腿负载 1.33x 而非 2x，"
+                         "后腿力矩从 32 降到 21 N·m）")
     ap.add_argument("--kp", type=float, default=None,
                     help="覆盖站立/运行时的 kp（默认 %.0f）。实机 2026-10-28 实测："
                          "后腿小腿扛 29 N·m 时，kp=150 的稳态误差 = 29/150 = 0.19 rad"
@@ -1114,6 +1139,8 @@ def main():
     if args.kd is not None:
         KD_FINAL = float(args.kd)
     # 运行时覆盖 IK 步态参数（必须在任何 gait_for 调用之前）
+    if args.gait_type == "ik":
+        set_gait_pattern(args.gait_pattern)     # 先切模式，再让单参覆盖生效
     set_ik_params(lift=args.ik_lift, duty=args.ik_duty, gain=args.ik_gain,
                   freq=args.ik_freq)
     Runner(args).run()

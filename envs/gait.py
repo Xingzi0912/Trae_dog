@@ -104,7 +104,14 @@ LEG_X = np.array([0.22337, 0.22337, -0.22337, -0.22337])   # 脚在 body 系 x
 LEG_Y = np.array([0.1639, -0.1639, 0.1639, -0.1639])       # 脚在 body 系 y
 THIGH_Y = np.array([THIGH_Y_OFF, -THIGH_Y_OFF,
                     THIGH_Y_OFF, -THIGH_Y_OFF])            # hip 系横向偏移
-LEG_PHASE = np.array([0.0, 0.5, 0.5, 0.0])                 # 对角 trot
+LEG_PHASE_TROT = np.array([0.0, 0.5, 0.5, 0.0])   # 对角 trot：2 腿支撑
+# 四拍侧序步（walk）：任意时刻 3 条腿在支撑相，重心永远落在支撑三角形内 → 静态稳定。
+# 步序 LH → LF → RH → RF（左后 → 左前 → 右后 → 右前），按 [FL,FR,RL,RR] 展开。
+# 2026-11-01 用户提出：trot 只有 2 腿支撑，负载翻倍（9.8 kg/腿 → 后腿小腿 32 N·m），
+# kp=150 时下垂 12°，几何垮掉、整机往后倒。walk 把负载降到 6.5 kg/腿（21 N·m，
+# 下垂 8°），且静态稳定——即使腿软也只是蹲低，不会翻。
+LEG_PHASE_WALK = np.array([0.25, 0.75, 0.0, 0.5])
+LEG_PHASE = LEG_PHASE_TROT                                  # 默认仍是对角 trot
 # 2026-10-28 实测：把抬脚降到 0.035、支撑提到 0.62 后，仿真前进速度反而从
 # 0.132 掉到 0.075（后退仍 0.211）→ 说明"原地踏步"不是抬脚高度造成的，
 # 而是前向蹬地效率问题。已回退到 0.06/0.55（已知最好），改从
@@ -123,6 +130,34 @@ IK_MAX_STEP = 0.20      # 支撑相脚位移上限（m），防目标超出腿�
 # 避免上一轮"残差顶死 ±1（A=88~92%）"的失败模式。
 # 注意 gain≥1.3 时 fwd_1.0 会摔，故训练指令上限必须 ≤0.2。
 IK_STRIDE_GAIN = 1.6
+
+
+def set_gait_pattern(name: str) -> None:
+    """切换步态模式并配套设好 duty / 步频
+
+    trot：2 腿支撑（对角），duty 0.55，2~4 Hz。负载 2×，需要较硬的关节。
+    walk：3 腿支撑（四拍侧序），duty 0.75，1.2~2.0 Hz。负载 1.33×，静态稳定，
+          **腿软也走得动**（2026-11-01 用户提出，针对 19.5 kg + kp=150 的实机）。
+
+    必须在第一次调用 gait_ik_phase 之前执行（改的是模块全局，JIT trace 时读取）。
+    """
+    global LEG_PHASE, IK_DUTY, IK_LIFT, FREQ_MIN, FREQ_MAX, IK_STRIDE_GAIN
+    if name == "walk":
+        LEG_PHASE = LEG_PHASE_WALK
+        IK_DUTY = 0.75
+        IK_LIFT = 0.04
+        FREQ_MIN, FREQ_MAX = 1.2, 2.0
+        # duty 0.75 + 低频 → 支撑时间长达 0.56s，步幅会被放大到 180mm（腿长 0.46m
+        # 偏大），所以 walk 的步幅标定取 1.2（规划步幅 ≈135mm）
+        IK_STRIDE_GAIN = 1.2
+    elif name == "trot":
+        LEG_PHASE = LEG_PHASE_TROT
+        IK_DUTY = 0.55
+        IK_LIFT = 0.06
+        FREQ_MIN, FREQ_MAX = 2.0, 4.0
+        IK_STRIDE_GAIN = 1.6
+    else:
+        raise ValueError(f"未知步态模式 {name}（可选 trot / walk）")
 
 
 def _ik_planar(x, z):

@@ -143,10 +143,14 @@ def main():
                         help="蒸馏总步数（默认=教师 1/4）")
     parser.add_argument("--no_residual", action="store_true",
                         help="禁用残差模式（纯 PPO 从零学走路）")
-    parser.add_argument("--gait_mode", type=str, default=None,
-                        choices=["sine", "ik"],
+    parser.add_argument("--gait_mode", type=str, default=None, choices=["sine", "ik"],
                         help="基准步态实现：sine=v24 正弦（仅前进稳定）；"
                              "ik=v25 IK 全向步进。缺省=EnvConfig 默认 sine")
+    parser.add_argument("--gait_pattern", type=str, default=None,
+                        choices=["trot", "walk"],
+                        help="IK 步态的相位模式。trot=对角 2 腿支撑（默认）；"
+                             "walk=四拍侧序 3 腿支撑、静态稳定，腿软/重心偏后的"
+                             "实机用这个（每腿负载 1.33x 而非 2x）")
     parser.add_argument("--no_dr", action="store_true",
                         help="禁用域随机化")
     parser.add_argument("--dr_pools", type=int, default=256,
@@ -257,6 +261,15 @@ def main():
         cmd_kwargs["yaw_lin_scale"] = float(args.yaw_lin_scale)
     if args.w_yaw is not None:
         cmd_kwargs["w_yaw"] = float(args.w_yaw)
+
+    # 步态模式必须在 env 构造（JIT trace）之前写入 gait 模块常量
+    if args.gait_mode == "ik" and args.gait_pattern:
+        import envs.gait as _G
+        _G.set_gait_pattern(args.gait_pattern)
+        log(f"步态模式: {args.gait_pattern}  duty={_G.IK_DUTY:.2f} "
+            f"lift={_G.IK_LIFT:.3f} gain={_G.IK_STRIDE_GAIN:.2f} "
+            f"freq={_G.FREQ_MIN:.1f}~{_G.FREQ_MAX:.1f}Hz "
+            f"相位={np.round(_G.LEG_PHASE, 2).tolist()}")
 
     env_cfg = EnvConfig(
         dr_enabled=not args.no_dr,

@@ -103,9 +103,16 @@ def main() -> None:
     ap.add_argument("--stride_gain", type=float, default=None,
                     help="覆盖 IK 规划步幅的标定系数（默认 %.2f）。"
                          "调大 = 步幅更大（对抗打滑），过大会失稳" % G.IK_STRIDE_GAIN)
+    ap.add_argument("--gait_pattern", type=str, default=None,
+                    choices=["trot", "walk"],
+                    help="IK 相位模式：trot=对角 2 腿支撑；walk=四拍 3 腿支撑"
+                         "（静态稳定，腿软时用）。会先设好 duty/lift/freq/gain，"
+                         "再被 --lift/--duty 等单参覆盖")
     args = ap.parse_args()
 
     # 步态常量必须在首次 step（JIT trace）之前写入
+    if getattr(args, "gait_pattern", None):
+        G.set_gait_pattern(args.gait_pattern)
     for name, val in (("IK_LIFT", args.lift), ("IK_DUTY", args.duty),
                       ("IK_MAX_STEP", args.max_step),
                       ("FREQ_MAX", args.freq_max),
